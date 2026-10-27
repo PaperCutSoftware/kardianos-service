@@ -332,6 +332,10 @@ func (s *darwinLaunchdService) Stop() error {
 	if err := s.userContextRequired(); err != nil {
 		return err
 	}
+	if s.level == ServiceLevelAllUsers {
+		// Uninstall leaves running copies, so the plist may be gone. Stop by label.
+		return run("launchctl", "remove", s.Name)
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err

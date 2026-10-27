@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -178,5 +179,26 @@ func TestDarwinAllUsersUninstallSkipsStop(t *testing.T) {
 				t.Errorf("plist not removed: %v", err)
 			}
 		})
+	}
+}
+
+func TestDarwinStopCommand(t *testing.T) {
+	stubPrivileged(t, false)
+	tests := []struct {
+		level ServiceLevel
+		want  string
+	}{
+		// AllUsers stops by label, because Uninstall may have removed the plist.
+		{ServiceLevelAllUsers, "launchctl remove svc"},
+		{ServiceLevelSystem, "launchctl unload /Library/LaunchDaemons/svc.plist"},
+	}
+	for _, tt := range tests {
+		calls := recordCommands(t, nil)
+		if err := newDarwinService(t, tt.level, nil).Stop(); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 || strings.Join((*calls)[0], " ") != tt.want {
+			t.Errorf("%s: ran %q, want %q", tt.level, *calls, tt.want)
+		}
 	}
 }
