@@ -39,11 +39,15 @@ func (darwinSystem) Interactive() bool {
 }
 
 func (darwinSystem) New(i Interface, c *Config) (Service, error) {
+	level, err := c.serviceLevel()
+	if err != nil {
+		return nil, err
+	}
 	s := &darwinLaunchdService{
 		i:      i,
 		Config: c,
 
-		userService: c.Option.bool(optionUserService, optionUserServiceDefault),
+		level: level,
 	}
 
 	return s, nil
@@ -72,7 +76,7 @@ type darwinLaunchdService struct {
 	i Interface
 	*Config
 
-	userService bool
+	level ServiceLevel
 }
 
 func (s *darwinLaunchdService) String() string {
@@ -86,7 +90,7 @@ func (s *darwinLaunchdService) Platform() string {
 	return version
 }
 
-func (s *darwinLaunchdService) getHomeDir() (string, error) {
+var userHomeDir = func() (string, error) {
 	u, err := user.Current()
 	if err == nil {
 		return u.HomeDir, nil
@@ -100,25 +104,31 @@ func (s *darwinLaunchdService) getHomeDir() (string, error) {
 	return homeDir, nil
 }
 
+var darwinLibraryDir = "/Library"
+
 func (s *darwinLaunchdService) getServiceFilePath() (string, error) {
-	if s.userService {
-		homeDir, err := s.getHomeDir()
+	switch s.level {
+	case ServiceLevelUser:
+		homeDir, err := userHomeDir()
 		if err != nil {
 			return "", err
 		}
 		return homeDir + "/Library/LaunchAgents/" + s.Name + ".plist", nil
+	case ServiceLevelAllUsers:
+		return darwinLibraryDir + "/LaunchAgents/" + s.Name + ".plist", nil
+	default:
+		return darwinLibraryDir + "/LaunchDaemons/" + s.Name + ".plist", nil
 	}
-	return "/Library/LaunchDaemons/" + s.Name + ".plist", nil
 }
 
 func (s *darwinLaunchdService) logDir() (string, error) {
 	if customDir := s.Option.string(optionLogDirectory, ""); customDir != "" {
 		return customDir, nil
 	}
-	if !s.userService {
-		return defaultDarwinLogDirectory, nil
+	if s.level == ServiceLevelUser {
+		return userHomeDir()
 	}
-	return s.getHomeDir()
+	return defaultDarwinLogDirectory, nil
 }
 
 func (s *darwinLaunchdService) getLogPaths() (string, string, error) {
@@ -168,6 +178,9 @@ func launchdBool(v bool) string {
 }
 
 func (s *darwinLaunchdService) Install() error {
+	if s.level == ServiceLevelAllUsers && !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err
@@ -177,7 +190,17 @@ func (s *darwinLaunchdService) Install() error {
 		return fmt.Errorf("Init already exists: %s", confPath)
 	}
 
-	if s.userService {
+	path, err := s.execPath()
+	if err != nil {
+		return err
+	}
+	if s.level == ServiceLevelAllUsers {
+		if err := checkExecutableOwnership(path); err != nil {
+			return err
+		}
+	}
+
+	if s.level == ServiceLevelUser {
 		// Ensure that ~/Library/LaunchAgents exists.
 		err = os.MkdirAll(filepath.Dir(confPath), 0700)
 		if err != nil {
@@ -185,16 +208,11 @@ func (s *darwinLaunchdService) Install() error {
 		}
 	}
 
-	f, err := os.Create(confPath)
+	f, err := s.createPlist(confPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	path, err := s.execPath()
-	if err != nil {
-		return err
-	}
 
 	stdOutPath, stdErrPath, _ := s.getLogPaths()
 
@@ -230,8 +248,31 @@ func (s *darwinLaunchdService) Install() error {
 	return err
 }
 
+func (s *darwinLaunchdService) createPlist(path string) (*os.File, error) {
+	if s.level != ServiceLevelAllUsers {
+		return os.Create(path)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return nil, err
+	}
+	// launchd ignores agent plists that are not 0644
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 func (s *darwinLaunchdService) Uninstall() error {
-	s.Stop()
+	if s.level == ServiceLevelAllUsers {
+		if !isPrivileged() {
+			return ErrRequiresPrivilege
+		}
+		// Running copies are left until each user logs out.
+	} else {
+		s.Stop()
+	}
 
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
@@ -240,7 +281,17 @@ func (s *darwinLaunchdService) Uninstall() error {
 	return os.Remove(confPath)
 }
 
+func (s *darwinLaunchdService) userContextRequired() error {
+	if s.level == ServiceLevelAllUsers && isPrivileged() {
+		return ErrUserContextRequired
+	}
+	return nil
+}
+
 func (s *darwinLaunchdService) Status() (Status, error) {
+	if err := s.userContextRequired(); err != nil {
+		return StatusUnknown, err
+	}
 	exitCode, out, err := runWithOutput("launchctl", "list", s.Name)
 	if exitCode == 0 && err != nil {
 		if !strings.Contains(err.Error(), "failed with stderr") {
@@ -267,6 +318,9 @@ func (s *darwinLaunchdService) Status() (Status, error) {
 }
 
 func (s *darwinLaunchdService) Start() error {
+	if err := s.userContextRequired(); err != nil {
+		return err
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err
@@ -275,6 +329,9 @@ func (s *darwinLaunchdService) Start() error {
 }
 
 func (s *darwinLaunchdService) Stop() error {
+	if err := s.userContextRequired(); err != nil {
+		return err
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err
