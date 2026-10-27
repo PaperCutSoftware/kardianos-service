@@ -5,6 +5,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -39,9 +40,19 @@ const (
 	errnoServiceDoesNotExist syscall.Errno = 1060
 )
 
+// golang.org/x/sys/windows does not export the per-user service types.
+const (
+	serviceUserService    = 0x40 // SERVICE_USER_SERVICE
+	serviceUserOwnProcess = windows.SERVICE_WIN32_OWN_PROCESS | serviceUserService
+)
+
+// mockable for tests
+var isPrivileged = func() bool { return windows.GetCurrentProcessToken().IsElevated() }
+
 type windowsService struct {
 	i Interface
 	*Config
+	level ServiceLevel
 
 	errSync      sync.Mutex
 	stopStartErr error
@@ -65,9 +76,23 @@ func (windowsSystem) Interactive() bool {
 	return interactive
 }
 func (windowsSystem) New(i Interface, c *Config) (Service, error) {
+	level, err := c.serviceLevel()
+	if err != nil {
+		return nil, err
+	}
+	switch level {
+	case ServiceLevelUser:
+		return nil, ErrUnsupportedServiceLevel
+	case ServiceLevelAllUsers:
+		// Per-user instances always run as the logged-in user.
+		if c.UserName != "" || c.Option.string("Password", "") != "" || c.Option.bool("Interactive", false) {
+			return nil, errors.New("AllUsers services run as the logged-in user and cannot set UserName, Password or Interactive")
+		}
+	}
 	ws := &windowsService{
 		i:      i,
 		Config: c,
+		level:  level,
 	}
 	return ws, nil
 }
@@ -265,7 +290,45 @@ func (ws *windowsService) setEnvironmentVariablesInRegistry() error {
 	return nil
 }
 
+// mgrConfig returns the service manager configuration used to create the service.
+func (ws *windowsService) mgrConfig() mgr.Config {
+	var startType int32
+	switch ws.Option.string(StartType, ServiceStartAutomatic) {
+	case ServiceStartAutomatic:
+		startType = mgr.StartAutomatic
+	case ServiceStartManual:
+		startType = mgr.StartManual
+	case ServiceStartDisabled:
+		startType = mgr.StartDisabled
+	}
+
+	var serviceType uint32
+	switch ws.level {
+	case ServiceLevelAllUsers:
+		serviceType = serviceUserOwnProcess
+	default:
+		serviceType = windows.SERVICE_WIN32_OWN_PROCESS
+		if ws.Option.bool("Interactive", false) {
+			serviceType = serviceType | windows.SERVICE_INTERACTIVE_PROCESS
+		}
+	}
+
+	return mgr.Config{
+		DisplayName:      ws.DisplayName,
+		Description:      ws.Description,
+		StartType:        uint32(startType),
+		ServiceStartName: ws.UserName,
+		Password:         ws.Option.string("Password", ""),
+		Dependencies:     ws.Dependencies,
+		DelayedAutoStart: ws.Option.bool("DelayedAutoStart", false),
+		ServiceType:      serviceType,
+	}
+}
+
 func (ws *windowsService) Install() error {
+	if ws.level == ServiceLevelAllUsers && !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
 	exepath, err := ws.execPath()
 	if err != nil {
 		return err
@@ -286,31 +349,8 @@ func (ws *windowsService) Install() error {
 		s.Close()
 		return fmt.Errorf("service %s already exists", ws.Name)
 	}
-	var startType int32
-	switch ws.Option.string(StartType, ServiceStartAutomatic) {
-	case ServiceStartAutomatic:
-		startType = mgr.StartAutomatic
-	case ServiceStartManual:
-		startType = mgr.StartManual
-	case ServiceStartDisabled:
-		startType = mgr.StartDisabled
-	}
 
-	serviceType := windows.SERVICE_WIN32_OWN_PROCESS
-	if ws.Option.bool("Interactive", false) {
-		serviceType = serviceType | windows.SERVICE_INTERACTIVE_PROCESS
-	}
-
-	s, err = m.CreateService(ws.Name, exepath, mgr.Config{
-		DisplayName:      ws.DisplayName,
-		Description:      ws.Description,
-		StartType:        uint32(startType),
-		ServiceStartName: ws.UserName,
-		Password:         ws.Option.string("Password", ""),
-		Dependencies:     ws.Dependencies,
-		DelayedAutoStart: ws.Option.bool("DelayedAutoStart", false),
-		ServiceType:      uint32(serviceType),
-	}, ws.Arguments...)
+	s, err = m.CreateService(ws.Name, exepath, ws.mgrConfig(), ws.Arguments...)
 	if err != nil {
 		return err
 	}
@@ -351,6 +391,9 @@ func (ws *windowsService) Install() error {
 }
 
 func (ws *windowsService) Uninstall() error {
+	if ws.level == ServiceLevelAllUsers && !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
 	m, err := mgr.Connect()
 	if err != nil {
 		return err
