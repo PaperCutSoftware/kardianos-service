@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log/syslog"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -67,7 +68,13 @@ func runWithOutput(command string, arguments ...string) (int, string, error) {
 	return runCommand(command, true, arguments...)
 }
 
-func runCommand(command string, readStdout bool, arguments ...string) (int, string, error) {
+// runCommand runs an external command. Replaced in tests.
+var runCommand = execCommand
+
+// isPrivileged reports whether the process runs as root. Replaced in tests.
+var isPrivileged = func() bool { return os.Geteuid() == 0 } //nolint:unused // Used by AllUsers on darwin and systemd.
+
+func execCommand(command string, readStdout bool, arguments ...string) (int, string, error) {
 	cmd := exec.Command(command, arguments...)
 
 	var output string
@@ -104,7 +111,9 @@ func runCommand(command string, readStdout bool, arguments ...string) (int, stri
 	if command == "launchctl" {
 		slurp, _ := ioutil.ReadAll(stderr)
 		if len(slurp) > 0 && !bytes.HasSuffix(slurp, []byte("Operation now in progress\n")) {
-			return 0, "", fmt.Errorf("%q failed with stderr: %s", command, slurp)
+			// Keep the exit code, so callers can tell launchctl's errors apart.
+			exitStatus, _ := isExitError(cmd.Wait())
+			return exitStatus, "", fmt.Errorf("%q failed with stderr: %s", command, slurp)
 		}
 	}
 

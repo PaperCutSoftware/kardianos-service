@@ -12,7 +12,9 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -39,11 +41,15 @@ func (darwinSystem) Interactive() bool {
 }
 
 func (darwinSystem) New(i Interface, c *Config) (Service, error) {
+	level, err := c.serviceLevel()
+	if err != nil {
+		return nil, err
+	}
 	s := &darwinLaunchdService{
 		i:      i,
 		Config: c,
 
-		userService: c.Option.bool(optionUserService, optionUserServiceDefault),
+		level: level,
 	}
 
 	return s, nil
@@ -72,7 +78,7 @@ type darwinLaunchdService struct {
 	i Interface
 	*Config
 
-	userService bool
+	level ServiceLevel
 }
 
 func (s *darwinLaunchdService) String() string {
@@ -86,7 +92,7 @@ func (s *darwinLaunchdService) Platform() string {
 	return version
 }
 
-func (s *darwinLaunchdService) getHomeDir() (string, error) {
+var userHomeDir = func() (string, error) {
 	u, err := user.Current()
 	if err == nil {
 		return u.HomeDir, nil
@@ -100,25 +106,31 @@ func (s *darwinLaunchdService) getHomeDir() (string, error) {
 	return homeDir, nil
 }
 
+var darwinLibraryDir = "/Library"
+
 func (s *darwinLaunchdService) getServiceFilePath() (string, error) {
-	if s.userService {
-		homeDir, err := s.getHomeDir()
+	switch s.level {
+	case ServiceLevelUser:
+		homeDir, err := userHomeDir()
 		if err != nil {
 			return "", err
 		}
 		return homeDir + "/Library/LaunchAgents/" + s.Name + ".plist", nil
+	case ServiceLevelAllUsers:
+		return darwinLibraryDir + "/LaunchAgents/" + s.Name + ".plist", nil
+	default:
+		return darwinLibraryDir + "/LaunchDaemons/" + s.Name + ".plist", nil
 	}
-	return "/Library/LaunchDaemons/" + s.Name + ".plist", nil
 }
 
 func (s *darwinLaunchdService) logDir() (string, error) {
 	if customDir := s.Option.string(optionLogDirectory, ""); customDir != "" {
 		return customDir, nil
 	}
-	if !s.userService {
-		return defaultDarwinLogDirectory, nil
+	if s.level == ServiceLevelUser {
+		return userHomeDir()
 	}
-	return s.getHomeDir()
+	return defaultDarwinLogDirectory, nil
 }
 
 func (s *darwinLaunchdService) getLogPaths() (string, string, error) {
@@ -168,6 +180,9 @@ func launchdBool(v bool) string {
 }
 
 func (s *darwinLaunchdService) Install() error {
+	if s.level == ServiceLevelAllUsers && !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err
@@ -177,7 +192,17 @@ func (s *darwinLaunchdService) Install() error {
 		return fmt.Errorf("Init already exists: %s", confPath)
 	}
 
-	if s.userService {
+	path, err := s.execPath()
+	if err != nil {
+		return err
+	}
+	if s.level == ServiceLevelAllUsers {
+		if err := checkExecutableOwnership(path); err != nil {
+			return err
+		}
+	}
+
+	if s.level == ServiceLevelUser {
 		// Ensure that ~/Library/LaunchAgents exists.
 		err = os.MkdirAll(filepath.Dir(confPath), 0700)
 		if err != nil {
@@ -185,16 +210,11 @@ func (s *darwinLaunchdService) Install() error {
 		}
 	}
 
-	f, err := os.Create(confPath)
+	f, err := s.createPlist(confPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	path, err := s.execPath()
-	if err != nil {
-		return err
-	}
 
 	stdOutPath, stdErrPath, _ := s.getLogPaths()
 
@@ -230,8 +250,31 @@ func (s *darwinLaunchdService) Install() error {
 	return err
 }
 
+func (s *darwinLaunchdService) createPlist(path string) (*os.File, error) {
+	if s.level != ServiceLevelAllUsers {
+		return os.Create(path)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return nil, err
+	}
+	// launchd ignores agent plists that are not 0644
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 func (s *darwinLaunchdService) Uninstall() error {
-	s.Stop()
+	if s.level == ServiceLevelAllUsers {
+		if !isPrivileged() {
+			return ErrRequiresPrivilege
+		}
+		// Running copies are left until each user logs out.
+	} else {
+		s.Stop()
+	}
 
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
@@ -240,7 +283,17 @@ func (s *darwinLaunchdService) Uninstall() error {
 	return os.Remove(confPath)
 }
 
+func (s *darwinLaunchdService) userContextRequired() error {
+	if s.level == ServiceLevelAllUsers && isPrivileged() {
+		return ErrUserContextRequired
+	}
+	return nil
+}
+
 func (s *darwinLaunchdService) Status() (Status, error) {
+	if err := s.userContextRequired(); err != nil {
+		return StatusUnknown, err
+	}
 	exitCode, out, err := runWithOutput("launchctl", "list", s.Name)
 	if exitCode == 0 && err != nil {
 		if !strings.Contains(err.Error(), "failed with stderr") {
@@ -267,6 +320,9 @@ func (s *darwinLaunchdService) Status() (Status, error) {
 }
 
 func (s *darwinLaunchdService) Start() error {
+	if err := s.userContextRequired(); err != nil {
+		return err
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err
@@ -275,6 +331,13 @@ func (s *darwinLaunchdService) Start() error {
 }
 
 func (s *darwinLaunchdService) Stop() error {
+	if err := s.userContextRequired(); err != nil {
+		return err
+	}
+	if s.level == ServiceLevelAllUsers {
+		// Uninstall leaves running copies, so the plist may be gone. Stop by label.
+		return run("launchctl", "remove", s.Name)
+	}
 	confPath, err := s.getServiceFilePath()
 	if err != nil {
 		return err
@@ -289,6 +352,102 @@ func (s *darwinLaunchdService) Restart() error {
 	}
 	time.Sleep(50 * time.Millisecond)
 	return s.Start()
+}
+
+// launchctl exit codes for a service that isn't loaded in the domain.
+const (
+	launchctlNoSuchProcess = 3   // bootout: "Boot-out failed: 3: No such process"
+	launchctlNotFound      = 113 // kickstart: "Could not find service"
+)
+
+// StartAll attempts to start the service for every logged-in GUI user.
+func (s *darwinLaunchdService) StartAll() error {
+	uids, err := s.allUsers()
+	if err != nil {
+		return err
+	}
+	confPath, err := s.getServiceFilePath()
+	if err != nil {
+		return err
+	}
+	return forEachUser(uids, func(uid uint32) error {
+		domain := fmt.Sprintf("gui/%d", uid)
+		// kickstart does nothing to a running copy
+		// we also can't use bootstrap as a blanket command
+		code, _, err := runWithOutput("launchctl", "kickstart", domain+"/"+s.Name)
+		if code == launchctlNotFound {
+			err = run("launchctl", "bootstrap", domain, confPath)
+		}
+		return err
+	})
+}
+
+// StopAll unloads the service from every logged-in GUI user's domain
+// Take precedence over KeepAlive.
+func (s *darwinLaunchdService) StopAll() error {
+	uids, err := s.allUsers()
+	if err != nil {
+		return err
+	}
+	return forEachUser(uids, func(uid uint32) error {
+		code, _, err := runWithOutput("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, s.Name))
+		if code == launchctlNoSuchProcess {
+			return nil
+		}
+		return err
+	})
+}
+
+// run concurrently, to avoid the pathological case where each process takes
+// a long time to terminate
+func forEachUser(uids []uint32, f func(uid uint32) error) error {
+	errs := make([]error, len(uids))
+	var wg sync.WaitGroup
+	for i, uid := range uids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = f(uid)
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// allUsers checks StartAll and StopAll can run, and returns the uids of the
+// logged-in GUI users.
+func (s *darwinLaunchdService) allUsers() ([]uint32, error) {
+	if s.level != ServiceLevelAllUsers {
+		return nil, ErrUnsupportedOperation
+	}
+	if !isPrivileged() {
+		return nil, ErrRequiresPrivilege
+	}
+	_, out, err := runWithOutput("ps", "-axo", "uid=,comm=")
+	if err != nil {
+		return nil, err
+	}
+	return parseGUIUsers(out), nil
+}
+
+// parseGUIUsers returns the uids that own a loginwindow process in the output
+// of "ps -axo uid=,comm=", without duplicates or root.
+func parseGUIUsers(out string) []uint32 {
+	var uids []uint32
+	seen := map[uint32]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		uidField, comm, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || filepath.Base(strings.TrimSpace(comm)) != "loginwindow" {
+			continue
+		}
+		uid, err := strconv.ParseUint(uidField, 10, 32)
+		if err != nil || uid == 0 || seen[uint32(uid)] {
+			continue
+		}
+		seen[uint32(uid)] = true
+		uids = append(uids, uint32(uid))
+	}
+	return uids
 }
 
 func (s *darwinLaunchdService) Run() error {
