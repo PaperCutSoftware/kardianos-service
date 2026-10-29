@@ -111,7 +111,9 @@ func execCommand(command string, readStdout bool, arguments ...string) (int, str
 	if command == "launchctl" {
 		slurp, _ := ioutil.ReadAll(stderr)
 		if len(slurp) > 0 && !bytes.HasSuffix(slurp, []byte("Operation now in progress\n")) {
-			return 0, "", fmt.Errorf("%q failed with stderr: %s", command, slurp)
+			// Keep the exit code, so callers can tell launchctl's errors apart.
+			exitStatus, _ := isExitError(cmd.Wait())
+			return exitStatus, "", fmt.Errorf("%q failed with stderr: %s", command, slurp)
 		}
 	}
 

@@ -12,12 +12,21 @@ import (
 // outputs by the space-joined argv.
 func recordCommands(t *testing.T, outputs map[string]string) *[][]string { //nolint:unused // Used by darwin and systemd tests.
 	t.Helper()
+	return stubCommands(t, func(argv []string) (int, string, error) {
+		return 0, outputs[strings.Join(argv, " ")], nil
+	})
+}
+
+// stubCommands replaces runCommand for the rest of the test with result,
+// which gets each call's argv. The calls are appended to the returned slice.
+func stubCommands(t *testing.T, result func(argv []string) (int, string, error)) *[][]string { //nolint:unused // Used by darwin and systemd tests.
+	t.Helper()
 	var calls [][]string
 	prev := runCommand
 	runCommand = func(command string, readStdout bool, arguments ...string) (int, string, error) {
 		argv := append([]string{command}, arguments...)
 		calls = append(calls, argv)
-		return 0, outputs[strings.Join(argv, " ")], nil
+		return result(argv)
 	}
 	t.Cleanup(func() { runCommand = prev })
 	return &calls

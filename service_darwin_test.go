@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -201,4 +202,149 @@ func TestDarwinStopCommand(t *testing.T) {
 			t.Errorf("%s: ran %q, want %q", tt.level, *calls, tt.want)
 		}
 	}
+}
+
+func TestAllUsersAllCommandsRequirePrivilege(t *testing.T) {
+	stubPrivileged(t, false)
+	calls := recordCommands(t, nil)
+	s := newDarwinService(t, ServiceLevelAllUsers, nil)
+
+	for name, cmd := range map[string]func() error{"StartAll": s.StartAll, "StopAll": s.StopAll} {
+		if err := cmd(); !errors.Is(err, ErrRequiresPrivilege) {
+			t.Errorf("%s err = %v, want %v", name, err, ErrRequiresPrivilege)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Errorf("ran %q, want no commands", *calls)
+	}
+}
+
+func TestAllUsersAllCommandsOtherLevels(t *testing.T) {
+	stubPrivileged(t, true)
+	calls := recordCommands(t, nil)
+	for _, level := range []ServiceLevel{ServiceLevelSystem, ServiceLevelUser} {
+		s := newDarwinService(t, level, nil)
+		for name, cmd := range map[string]func() error{"StartAll": s.StartAll, "StopAll": s.StopAll} {
+			if err := cmd(); !errors.Is(err, ErrUnsupportedOperation) {
+				t.Errorf("%s %s err = %v, want %v", level, name, err, ErrUnsupportedOperation)
+			}
+		}
+	}
+	if len(*calls) != 0 {
+		t.Errorf("ran %q, want no commands", *calls)
+	}
+}
+
+func TestDarwinParseGUIUsers(t *testing.T) {
+	const loginwindow = "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+	tests := []struct {
+		name string
+		out  string
+		want []uint32
+	}{
+		{"empty", "", nil},
+		{"no loginwindow", "  501 /usr/sbin/cfprefsd\n    0 /sbin/launchd\n", nil},
+		{"root only", "    0 " + loginwindow + "\n", nil},
+		{
+			"two users",
+			"    1 /sbin/launchd\n" +
+				"  501 " + loginwindow + "\n" +
+				"    0 " + loginwindow + "\n" +
+				"  501 /Applications/Safari.app/Contents/MacOS/Safari\n" +
+				"  502 " + loginwindow + "\n" +
+				"  501 " + loginwindow + "\n" +
+				"  503 /Applications/Not loginwindow.app/Contents/MacOS/helper\n",
+			[]uint32{501, 502},
+		},
+	}
+	for _, tt := range tests {
+		got := parseGUIUsers(tt.out)
+		if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+			t.Errorf("%s: parseGUIUsers = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// guiUsersPS is "ps -axo uid=,comm=" output with users 501 and 502 logged in.
+const guiUsersPS = "  501 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\n" +
+	"  502 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\n"
+
+const psGUIUsers = "ps -axo uid=,comm="
+
+func TestDarwinStopAllCommands(t *testing.T) {
+	stubPrivileged(t, true)
+	// User 502 has no copy loaded, which is not an error.
+	calls := stubCommands(t, func(argv []string) (int, string, error) {
+		switch strings.Join(argv, " ") {
+		case psGUIUsers:
+			return 0, guiUsersPS, nil
+		case "launchctl bootout gui/502/svc":
+			return launchctlNoSuchProcess, "", errors.New("Boot-out failed: 3: No such process")
+		}
+		return 0, "", nil
+	})
+
+	if err := newDarwinService(t, ServiceLevelAllUsers, nil).StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{psGUIUsers, "launchctl bootout gui/501/svc", "launchctl bootout gui/502/svc"}
+	if got := joinCalls(*calls); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("ran %q, want %q", got, want)
+	}
+}
+
+func TestDarwinStartAllCommands(t *testing.T) {
+	stubPrivileged(t, true)
+	// User 501's copy is loaded, so kickstart starts it. User 502's isn't, so
+	// it is bootstrapped.
+	calls := stubCommands(t, func(argv []string) (int, string, error) {
+		switch strings.Join(argv, " ") {
+		case psGUIUsers:
+			return 0, guiUsersPS, nil
+		case "launchctl kickstart gui/502/svc":
+			return launchctlNotFound, "", errors.New(`Could not find service "svc"`)
+		}
+		return 0, "", nil
+	})
+
+	if err := newDarwinService(t, ServiceLevelAllUsers, nil).StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		psGUIUsers,
+		"launchctl kickstart gui/501/svc",
+		"launchctl kickstart gui/502/svc",
+		"launchctl bootstrap gui/502 /Library/LaunchAgents/svc.plist",
+	}
+	if got := joinCalls(*calls); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("ran %q, want %q", got, want)
+	}
+}
+
+func TestDarwinAllCommandsReturnErrors(t *testing.T) {
+	stubPrivileged(t, true)
+	stubCommands(t, func(argv []string) (int, string, error) {
+		if strings.Join(argv, " ") == psGUIUsers {
+			return 0, guiUsersPS, nil
+		}
+		return 1, "", errors.New("failed: " + argv[len(argv)-1])
+	})
+	s := newDarwinService(t, ServiceLevelAllUsers, nil)
+
+	// Every user's failure is returned, not just the first.
+	for name, cmd := range map[string]func() error{"StartAll": s.StartAll, "StopAll": s.StopAll} {
+		err := cmd()
+		if err == nil || !strings.Contains(err.Error(), "501") || !strings.Contains(err.Error(), "502") {
+			t.Errorf("%s err = %v, want both users' failures", name, err)
+		}
+	}
+}
+
+// joinCalls returns each recorded call's argv joined with spaces.
+func joinCalls(calls [][]string) []string {
+	var out []string
+	for _, c := range calls {
+		out = append(out, strings.Join(c, " "))
+	}
+	return out
 }

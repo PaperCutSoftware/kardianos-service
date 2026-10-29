@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -350,6 +351,90 @@ func (s *darwinLaunchdService) Restart() error {
 	}
 	time.Sleep(50 * time.Millisecond)
 	return s.Start()
+}
+
+// launchctl exit codes for a service that isn't loaded in the domain.
+const (
+	launchctlNoSuchProcess = 3   // bootout: "Boot-out failed: 3: No such process"
+	launchctlNotFound      = 113 // kickstart: "Could not find service"
+)
+
+// StartAll attempts to start the service for every logged-in GUI user.
+func (s *darwinLaunchdService) StartAll() error {
+	uids, err := s.allUsers()
+	if err != nil {
+		return err
+	}
+	confPath, err := s.getServiceFilePath()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, uid := range uids {
+		domain := fmt.Sprintf("gui/%d", uid)
+		// kickstart does nothing to a running copy. bootstrap can't be used
+		// for every copy, because "already loaded" fails with the generic exit code 5.
+		code, _, err := runWithOutput("launchctl", "kickstart", domain+"/"+s.Name)
+		if code == launchctlNotFound {
+			err = run("launchctl", "bootstrap", domain, confPath)
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// StopAll unloads the service from every logged-in GUI user's domain
+// Take precedence over KeepAlive.
+func (s *darwinLaunchdService) StopAll() error {
+	uids, err := s.allUsers()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, uid := range uids {
+		code, _, err := runWithOutput("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, s.Name))
+		if code == launchctlNoSuchProcess {
+			err = nil
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// allUsers checks StartAll and StopAll can run, and returns the uids of the
+// logged-in GUI users.
+func (s *darwinLaunchdService) allUsers() ([]uint32, error) {
+	if s.level != ServiceLevelAllUsers {
+		return nil, ErrUnsupportedOperation
+	}
+	if !isPrivileged() {
+		return nil, ErrRequiresPrivilege
+	}
+	_, out, err := runWithOutput("ps", "-axo", "uid=,comm=")
+	if err != nil {
+		return nil, err
+	}
+	return parseGUIUsers(out), nil
+}
+
+// parseGUIUsers returns the uids that own a loginwindow process in the output
+// of "ps -axo uid=,comm=", without duplicates or root.
+func parseGUIUsers(out string) []uint32 {
+	var uids []uint32
+	seen := map[uint32]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		uidField, comm, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || filepath.Base(strings.TrimSpace(comm)) != "loginwindow" {
+			continue
+		}
+		uid, err := strconv.ParseUint(uidField, 10, 32)
+		if err != nil || uid == 0 || seen[uint32(uid)] {
+			continue
+		}
+		seen[uint32(uid)] = true
+		uids = append(uids, uint32(uid))
+	}
+	return uids
 }
 
 func (s *darwinLaunchdService) Run() error {
