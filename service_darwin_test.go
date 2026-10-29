@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // newDarwinService builds a launchd service at the given level, with the
@@ -287,7 +290,7 @@ func TestDarwinStopAllCommands(t *testing.T) {
 	if err := newDarwinService(t, ServiceLevelAllUsers, nil).StopAll(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{psGUIUsers, "launchctl bootout gui/501/svc", "launchctl bootout gui/502/svc"}
+	want := []string{"launchctl bootout gui/501/svc", "launchctl bootout gui/502/svc", psGUIUsers}
 	if got := joinCalls(*calls); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("ran %q, want %q", got, want)
 	}
@@ -311,10 +314,10 @@ func TestDarwinStartAllCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		psGUIUsers,
+		"launchctl bootstrap gui/502 /Library/LaunchAgents/svc.plist",
 		"launchctl kickstart gui/501/svc",
 		"launchctl kickstart gui/502/svc",
-		"launchctl bootstrap gui/502 /Library/LaunchAgents/svc.plist",
+		psGUIUsers,
 	}
 	if got := joinCalls(*calls); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("ran %q, want %q", got, want)
@@ -331,7 +334,6 @@ func TestDarwinAllCommandsReturnErrors(t *testing.T) {
 	})
 	s := newDarwinService(t, ServiceLevelAllUsers, nil)
 
-	// Every user's failure is returned, not just the first.
 	for name, cmd := range map[string]func() error{"StartAll": s.StartAll, "StopAll": s.StopAll} {
 		err := cmd()
 		if err == nil || !strings.Contains(err.Error(), "501") || !strings.Contains(err.Error(), "502") {
@@ -340,11 +342,51 @@ func TestDarwinAllCommandsReturnErrors(t *testing.T) {
 	}
 }
 
-// joinCalls returns each recorded call's argv joined with spaces.
+func TestDarwinAllCommandsRunConcurrently(t *testing.T) {
+	stubPrivileged(t, true)
+	var (
+		mu      sync.Mutex
+		started int
+	)
+	all := make(chan struct{})
+	stubCommands(t, func(argv []string) (int, string, error) {
+		if strings.Join(argv, " ") == psGUIUsers {
+			return 0, guiUsersPS, nil
+		}
+		mu.Lock()
+		ch := all
+		started++
+		if started == 2 {
+			close(ch)
+		}
+		mu.Unlock()
+		select {
+		case <-ch:
+			return 0, "", nil
+		case <-time.After(5 * time.Second):
+			return 1, "", errors.New("users' commands ran one at a time")
+		}
+	})
+	s := newDarwinService(t, ServiceLevelAllUsers, nil)
+
+	for name, cmd := range map[string]func() error{"StartAll": s.StartAll, "StopAll": s.StopAll} {
+		mu.Lock()
+		started = 0
+		all = make(chan struct{})
+		mu.Unlock()
+		if err := cmd(); err != nil {
+			t.Errorf("%s err = %v", name, err)
+		}
+	}
+}
+
+// joinCalls returns each recorded call's argv joined with spaces, sorted,
+// because each user's commands run concurrently.
 func joinCalls(calls [][]string) []string {
 	var out []string
 	for _, c := range calls {
 		out = append(out, strings.Join(c, " "))
 	}
+	sort.Strings(out)
 	return out
 }

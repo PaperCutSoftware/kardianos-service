@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -369,18 +370,16 @@ func (s *darwinLaunchdService) StartAll() error {
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, uid := range uids {
+	return forEachUser(uids, func(uid uint32) error {
 		domain := fmt.Sprintf("gui/%d", uid)
-		// kickstart does nothing to a running copy. bootstrap can't be used
-		// for every copy, because "already loaded" fails with the generic exit code 5.
+		// kickstart does nothing to a running copy
+		// we also can't use bootstrap as a blanket command
 		code, _, err := runWithOutput("launchctl", "kickstart", domain+"/"+s.Name)
 		if code == launchctlNotFound {
 			err = run("launchctl", "bootstrap", domain, confPath)
 		}
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+		return err
+	})
 }
 
 // StopAll unloads the service from every logged-in GUI user's domain
@@ -390,14 +389,28 @@ func (s *darwinLaunchdService) StopAll() error {
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, uid := range uids {
+	return forEachUser(uids, func(uid uint32) error {
 		code, _, err := runWithOutput("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, s.Name))
 		if code == launchctlNoSuchProcess {
-			err = nil
+			return nil
 		}
-		errs = append(errs, err)
+		return err
+	})
+}
+
+// run concurrently, to avoid the pathological case where each process takes
+// a long time to terminate
+func forEachUser(uids []uint32, f func(uid uint32) error) error {
+	errs := make([]error, len(uids))
+	var wg sync.WaitGroup
+	for i, uid := range uids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = f(uid)
+		}()
 	}
+	wg.Wait()
 	return errors.Join(errs...)
 }
 

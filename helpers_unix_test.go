@@ -4,6 +4,7 @@ package service
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -21,11 +22,16 @@ func recordCommands(t *testing.T, outputs map[string]string) *[][]string { //nol
 // which gets each call's argv. The calls are appended to the returned slice.
 func stubCommands(t *testing.T, result func(argv []string) (int, string, error)) *[][]string { //nolint:unused // Used by darwin and systemd tests.
 	t.Helper()
-	var calls [][]string
+	var (
+		mu    sync.Mutex
+		calls [][]string
+	)
 	prev := runCommand
 	runCommand = func(command string, readStdout bool, arguments ...string) (int, string, error) {
 		argv := append([]string{command}, arguments...)
+		mu.Lock()
 		calls = append(calls, argv)
+		mu.Unlock()
 		return result(argv)
 	}
 	t.Cleanup(func() { runCommand = prev })
