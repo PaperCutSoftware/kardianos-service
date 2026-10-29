@@ -187,6 +187,9 @@ var (
 	// ErrUserContextRequired is returned when an operation must be run as
 	// the user rather than as root or administrator.
 	ErrUserContextRequired = errors.New("this operation must be run as the user, not as root or administrator")
+	// ErrUnsupportedOperation is returned for an operation that this service
+	// level does not support on this platform.
+	ErrUnsupportedOperation = errors.New("this operation is not supported for this service level on this platform")
 )
 
 // New creates a new service based on a service interface and configuration.
@@ -514,8 +517,23 @@ type Service interface {
 	Status() (Status, error)
 }
 
+// AllUsersController is implemented by services that support
+// ServiceLevelAllUsers. Both methods require root or administrator
+// privileges, and act on the copy running for every logged-in user.
+// They return ErrUnsupportedOperation for other service levels.
+type AllUsersController interface {
+	// StartAll starts the service for every logged-in user whose copy is not running.
+	StartAll() error
+	// StopAll stops every running copy, and returns once they have stopped.
+	StopAll() error
+}
+
 // ControlAction list valid string texts to use in Control.
 var ControlAction = [5]string{"start", "stop", "restart", "install", "uninstall"}
+
+// AllUsersControlAction lists the extra actions Control accepts for an
+// AllUsersController.
+var AllUsersControlAction = [2]string{"startall", "stopall"}
 
 // Control issues control functions to the service from a given action string.
 func Control(s Service, action string) error {
@@ -531,11 +549,21 @@ func Control(s Service, action string) error {
 		err = s.Install()
 	case ControlAction[4]:
 		err = s.Uninstall()
+	case AllUsersControlAction[0], AllUsersControlAction[1]:
+		c, ok := s.(AllUsersController)
+		switch {
+		case !ok:
+			err = ErrUnsupportedOperation
+		case action == AllUsersControlAction[0]:
+			err = c.StartAll()
+		default:
+			err = c.StopAll()
+		}
 	default:
 		err = fmt.Errorf("Unknown action %s", action)
 	}
 	if err != nil {
-		return fmt.Errorf("Failed to %s %v: %v", action, s, err)
+		return fmt.Errorf("Failed to %s %v: %w", action, s, err)
 	}
 	return nil
 }
