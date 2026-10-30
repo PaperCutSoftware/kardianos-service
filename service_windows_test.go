@@ -124,7 +124,7 @@ func TestWindowsAllUsersCommandsRequirePrivilege(t *testing.T) {
 	}{
 		{"Stop", ws.Stop, ErrRequiresPrivilege},
 		{"Restart", ws.Restart, ErrRequiresPrivilege},
-		{"Start", ws.Start, ErrUnsupportedOperation},
+		{"Start", ws.Start, ErrRequiresPrivilege},
 	}
 	for _, tt := range tests {
 		if err := tt.cmd(); !errors.Is(err, tt.want) {
@@ -196,6 +196,37 @@ func TestAllUsersAllCommandsOtherLevels(t *testing.T) {
 	for name, cmd := range map[string]func() error{"StartAll": ws.StartAll, "StopAll": ws.StopAll} {
 		if err := cmd(); !errors.Is(err, ErrUnsupportedOperation) {
 			t.Errorf("%s err = %v, want %v", name, err, ErrUnsupportedOperation)
+		}
+	}
+}
+
+func TestWindowsLogonSuffix(t *testing.T) {
+	// The caller is in session 2. Process 20 is in session 2, 30 in session 3.
+	stubProcessSession(t, map[uint32]uint32{20: 2, 30: 3})
+	const instance = serviceUserServiceInstance | serviceUserOwnProcess
+	mine := serviceState{"cbdhsvc_4f2a1c", instance, windows.SERVICE_RUNNING, 20}
+	other := serviceState{"cbdhsvc_9e01b7", instance, windows.SERVICE_RUNNING, 30}
+	stopped := serviceState{"Svc_4f2a1c", instance, windows.SERVICE_STOPPED, 0}
+	notInstance := serviceState{"Spooler_4f2a1c", windows.SERVICE_WIN32_OWN_PROCESS, windows.SERVICE_RUNNING, 20}
+	noSuffix := serviceState{"cbdhsvc", instance, windows.SERVICE_RUNNING, 20}
+
+	tests := []struct {
+		name     string
+		services []serviceState
+		want     string
+	}{
+		{"none", nil, ""},
+		{"mine", []serviceState{mine}, "4f2a1c"},
+		{"other session", []serviceState{other}, ""},
+		{"stopped", []serviceState{stopped}, ""},
+		{"not an instance", []serviceState{notInstance}, ""},
+		{"no suffix", []serviceState{noSuffix}, ""},
+		{"mix", []serviceState{other, stopped, notInstance, noSuffix, mine}, "4f2a1c"},
+	}
+	for _, tt := range tests {
+		got, ok := logonSuffix(tt.services, 2)
+		if got != tt.want || ok != (tt.want != "") {
+			t.Errorf("%s: logonSuffix = %q, %v, want %q", tt.name, got, ok, tt.want)
 		}
 	}
 }

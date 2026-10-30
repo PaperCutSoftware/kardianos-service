@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -44,6 +45,10 @@ const (
 const (
 	serviceUserService    = 0x40 // SERVICE_USER_SERVICE
 	serviceUserOwnProcess = windows.SERVICE_WIN32_OWN_PROCESS | serviceUserService
+
+	serviceUserServiceInstance = 0x80 // SERVICE_USERSERVICE_INSTANCE
+	// windows.SERVICE_TYPE_ALL leaves out the per-user bits.
+	serviceTypeAll = 0x3ff
 )
 
 // mockable for tests
@@ -600,10 +605,14 @@ type instanceState struct {
 // determines if the name is a per-user service instance of the template service
 func isInstanceOf(name, template string) bool {
 	prefix := template + "_"
-	if len(name) <= len(prefix) || !strings.EqualFold(name[:len(prefix)], prefix) {
+	return len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) && isHex(name[len(prefix):])
+}
+
+func isHex(s string) bool {
+	if s == "" {
 		return false
 	}
-	for _, c := range name[len(prefix):] {
+	for _, c := range s {
 		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
 			return false
 		}
@@ -704,10 +713,101 @@ func (ws *windowsService) allUsersStatus() (Status, error) {
 	return StatusStopped, nil
 }
 
-// allUsersStart is not supported yet: a stopped instance has no process, so
-// it can't be matched to the caller's session.
 func (ws *windowsService) allUsersStart() error {
-	return ErrUnsupportedOperation
+	if !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
+	m, err := lowPrivMgr()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+
+	_, running, err := ws.ownInstance(m)
+	if err != nil || running {
+		return err
+	}
+	return ws.startStoppedInstance(m)
+}
+
+var errNoSessionInstance = errors.New("the service has no instance in this session until the next logon")
+
+// We can't find a stopped instance on its own. We need need to derive the
+// user suffix from a different running process.
+func (ws *windowsService) startStoppedInstance(m *mgr.Mgr) error {
+	services, err := listServices(m)
+	if err != nil {
+		return err
+	}
+	session, err := processSession(windows.GetCurrentProcessId())
+	if err != nil {
+		return err
+	}
+	suffix, ok := logonSuffix(services, session)
+	if !ok {
+		return errNoSessionInstance
+	}
+	err = startInstance(m, ws.Name+"_"+suffix)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return errNoSessionInstance
+	}
+	return err
+}
+
+type serviceState struct {
+	name  string
+	typ   uint32
+	state uint32
+	pid   uint32
+}
+
+func logonSuffix(services []serviceState, session uint32) (string, bool) {
+	for _, s := range services {
+		if s.typ&serviceUserServiceInstance == 0 || s.state != windows.SERVICE_RUNNING || s.pid == 0 {
+			continue
+		}
+		i := strings.LastIndex(s.name, "_")
+		if i < 0 || !isHex(s.name[i+1:]) {
+			continue
+		}
+		if got, err := processSession(s.pid); err == nil && got == session {
+			return s.name[i+1:], true
+		}
+	}
+	return "", false
+}
+
+func listServices(m *mgr.Mgr) ([]serviceState, error) {
+	var buf []byte
+	var needed, returned uint32
+	for {
+		var p *byte
+		if len(buf) > 0 {
+			p = &buf[0]
+		}
+
+		// we make use of EnumServicesStatusEx instead of mgr, as it's just a
+		// single call
+		err := windows.EnumServicesStatusEx(m.Handle, windows.SC_ENUM_PROCESS_INFO, serviceTypeAll,
+			windows.SERVICE_STATE_ALL, p, uint32(len(buf)), &needed, &returned, nil, nil)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, windows.ERROR_MORE_DATA) || needed <= uint32(len(buf)) {
+			return nil, err
+		}
+		buf = make([]byte, needed)
+	}
+	if returned == 0 {
+		return nil, nil
+	}
+	entries := unsafe.Slice((*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buf[0])), int(returned))
+	services := make([]serviceState, 0, len(entries))
+	for _, e := range entries {
+		st := e.ServiceStatusProcess
+		services = append(services, serviceState{windows.UTF16PtrToString(e.ServiceName), st.ServiceType, st.CurrentState, st.ProcessId})
+	}
+	return services, nil
 }
 
 func (ws *windowsService) allUsersStop() error {
@@ -742,7 +842,7 @@ func (ws *windowsService) allUsersRestart() error {
 		return err
 	}
 	if !running {
-		return ws.allUsersStart()
+		return ws.startStoppedInstance(m)
 	}
 	if err := stopInstances(m, []string{name}); err != nil {
 		return err
@@ -750,8 +850,6 @@ func (ws *windowsService) allUsersRestart() error {
 	return startInstance(m, name)
 }
 
-// StartAll starts every user's stopped instance. Instances only exist for
-// logged-on users, and only from their first logon after install.
 func (ws *windowsService) StartAll() error {
 	m, instances, err := ws.allInstances()
 	if err != nil {
