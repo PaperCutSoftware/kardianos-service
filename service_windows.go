@@ -88,6 +88,9 @@ func (windowsSystem) New(i Interface, c *Config) (Service, error) {
 		if c.UserName != "" || c.Option.string("Password", "") != "" || c.Option.bool("Interactive", false) {
 			return nil, errors.New("AllUsers services run as the logged-in user and cannot set UserName, Password or Interactive")
 		}
+		if len(c.EnvVars) > 0 {
+			return nil, errors.New("AllUsers services cannot set EnvVars: per-user instances don't receive the template's environment")
+		}
 	}
 	ws := &windowsService{
 		i:      i,
@@ -256,9 +259,12 @@ func lowPrivMgr() (*mgr.Mgr, error) {
 }
 
 func lowPrivSvc(m *mgr.Mgr, name string) (*mgr.Service, error) {
-	h, err := windows.OpenService(
-		m.Handle, syscall.StringToUTF16Ptr(name),
-		windows.SERVICE_QUERY_CONFIG|windows.SERVICE_QUERY_STATUS|windows.SERVICE_START|windows.SERVICE_STOP)
+	return openService(m, name, windows.SERVICE_QUERY_CONFIG|windows.SERVICE_QUERY_STATUS|windows.SERVICE_START|windows.SERVICE_STOP)
+}
+
+// openService opens name with only the given access rights.
+func openService(m *mgr.Mgr, name string, access uint32) (*mgr.Service, error) {
+	h, err := windows.OpenService(m.Handle, syscall.StringToUTF16Ptr(name), access)
 	if err != nil {
 		return nil, err
 	}
@@ -447,6 +453,9 @@ func (ws *windowsService) Run() error {
 }
 
 func (ws *windowsService) Status() (Status, error) {
+	if ws.level == ServiceLevelAllUsers {
+		return ws.allUsersStatus()
+	}
 	m, err := lowPrivMgr()
 	if err != nil {
 		return StatusUnknown, err
@@ -488,6 +497,9 @@ func (ws *windowsService) Status() (Status, error) {
 }
 
 func (ws *windowsService) Start() error {
+	if ws.level == ServiceLevelAllUsers {
+		return ws.allUsersStart()
+	}
 	m, err := lowPrivMgr()
 	if err != nil {
 		return err
@@ -503,6 +515,9 @@ func (ws *windowsService) Start() error {
 }
 
 func (ws *windowsService) Stop() error {
+	if ws.level == ServiceLevelAllUsers {
+		return ws.allUsersStop()
+	}
 	m, err := lowPrivMgr()
 	if err != nil {
 		return err
@@ -519,6 +534,9 @@ func (ws *windowsService) Stop() error {
 }
 
 func (ws *windowsService) Restart() error {
+	if ws.level == ServiceLevelAllUsers {
+		return ws.allUsersRestart()
+	}
 	m, err := lowPrivMgr()
 	if err != nil {
 		return err
@@ -565,6 +583,294 @@ func (ws *windowsService) stopWait(s *mgr.Service) error {
 		}
 	}
 	return nil
+}
+
+// Windows creates a per-user service instance named "<Name>_<hex>", in
+// each user's session at logon.
+//
+// Users aren't given the required permissions to Start, Stop and Restart their
+// services, but they can query their status.
+
+type instanceState struct {
+	name  string
+	state svc.State
+	pid   uint32
+}
+
+// determines if the name is a per-user service instance of the template service
+func isInstanceOf(name, template string) bool {
+	prefix := template + "_"
+	if len(name) <= len(prefix) || !strings.EqualFold(name[:len(prefix)], prefix) {
+		return false
+	}
+	for _, c := range name[len(prefix):] {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+			return false
+		}
+	}
+	return true
+}
+
+// listInstances lists all instances with their state and process ID
+func listInstances(m *mgr.Mgr, template string) ([]instanceState, error) {
+	names, err := m.ListServices()
+	if err != nil {
+		return nil, err
+	}
+	var instances []instanceState
+	for _, name := range names {
+		if !isInstanceOf(name, template) {
+			continue
+		}
+		status, err := queryService(m, name)
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		instances = append(instances, instanceState{name, status.State, status.ProcessId})
+	}
+	return instances, nil
+}
+
+func queryService(m *mgr.Mgr, name string) (svc.Status, error) {
+	s, err := openService(m, name, windows.SERVICE_QUERY_STATUS)
+	if err != nil {
+		return svc.Status{}, err
+	}
+	defer s.Close()
+	return s.Query()
+}
+
+// mockable for tests
+var processSession = func(pid uint32) (uint32, error) {
+	var session uint32
+	err := windows.ProcessIdToSessionId(pid, &session)
+	return session, err
+}
+
+func ownRunningInstance(instances []instanceState, session uint32) (string, bool) {
+	for _, in := range instances {
+		if in.pid == 0 {
+			continue
+		}
+
+		// we can't read another user's session, so any successful reads are
+		// guaranteed to be ours
+		if s, err := processSession(in.pid); err == nil && s == session {
+			return in.name, true
+		}
+	}
+	return "", false
+}
+
+func (ws *windowsService) ownInstance(m *mgr.Mgr) (name string, running bool, err error) {
+	t, err := openService(m, ws.Name, windows.SERVICE_QUERY_STATUS)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return "", false, ErrNotInstalled
+	}
+	if err != nil {
+		return "", false, err
+	}
+	t.Close()
+
+	instances, err := listInstances(m, ws.Name)
+	if err != nil {
+		return "", false, err
+	}
+	session, err := processSession(windows.GetCurrentProcessId())
+	if err != nil {
+		return "", false, err
+	}
+	name, running = ownRunningInstance(instances, session)
+	return name, running, nil
+}
+
+func (ws *windowsService) allUsersStatus() (Status, error) {
+	m, err := lowPrivMgr()
+	if err != nil {
+		return StatusUnknown, err
+	}
+	defer m.Disconnect()
+
+	_, running, err := ws.ownInstance(m)
+	if err != nil {
+		return StatusUnknown, err
+	}
+	if running {
+		return StatusRunning, nil
+	}
+	return StatusStopped, nil
+}
+
+// allUsersStart is not supported yet: a stopped instance has no process, so
+// it can't be matched to the caller's session.
+func (ws *windowsService) allUsersStart() error {
+	return ErrUnsupportedOperation
+}
+
+func (ws *windowsService) allUsersStop() error {
+	if !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
+	m, err := lowPrivMgr()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+
+	name, running, err := ws.ownInstance(m)
+	if err != nil || !running {
+		return err
+	}
+	return stopInstances(m, []string{name})
+}
+
+func (ws *windowsService) allUsersRestart() error {
+	if !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
+	m, err := lowPrivMgr()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+
+	name, running, err := ws.ownInstance(m)
+	if err != nil {
+		return err
+	}
+	if !running {
+		return ws.allUsersStart()
+	}
+	if err := stopInstances(m, []string{name}); err != nil {
+		return err
+	}
+	return startInstance(m, name)
+}
+
+// StartAll starts every user's stopped instance. Instances only exist for
+// logged-on users, and only from their first logon after install.
+func (ws *windowsService) StartAll() error {
+	m, instances, err := ws.allInstances()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+
+	var errs []error
+	for _, in := range instances {
+		if in.state == svc.Stopped {
+			errs = append(errs, startInstance(m, in.name))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// StopAll stops every user's running instance, and returns once they have
+// stopped.
+func (ws *windowsService) StopAll() error {
+	m, instances, err := ws.allInstances()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+
+	var names []string
+	for _, in := range instances {
+		if in.state != svc.Stopped {
+			names = append(names, in.name)
+		}
+	}
+	return stopInstances(m, names)
+}
+
+// Will list instances that are
+func (ws *windowsService) allInstances() (*mgr.Mgr, []instanceState, error) {
+	if ws.level != ServiceLevelAllUsers {
+		return nil, nil, ErrUnsupportedOperation
+	}
+	if !isPrivileged() {
+		return nil, nil, ErrRequiresPrivilege
+	}
+	m, err := lowPrivMgr()
+	if err != nil {
+		return nil, nil, err
+	}
+	instances, err := listInstances(m, ws.Name)
+	if err != nil {
+		m.Disconnect()
+		return nil, nil, err
+	}
+	return m, instances, nil
+}
+
+// runs as the service's owner
+func startInstance(m *mgr.Mgr, name string) error {
+	s, err := openService(m, name, windows.SERVICE_START)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	defer s.Close()
+	if err := s.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	return nil
+}
+
+// stopInstances sends a stop to every named instance
+func stopInstances(m *mgr.Mgr, names []string) error {
+	var errs []error
+	var stopping []*mgr.Service
+	for _, name := range names {
+		s, err := openService(m, name, windows.SERVICE_STOP|windows.SERVICE_QUERY_STATUS)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		defer s.Close()
+		_, err = s.Control(svc.Stop)
+		switch {
+		case errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE):
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		default:
+			stopping = append(stopping, s)
+		}
+	}
+	errs = append(errs, waitStopped(stopping, getStopTimeout()))
+	return errors.Join(errs...)
+}
+
+// polls for all services to stop
+func waitStopped(services []*mgr.Service, timeout time.Duration) error {
+	const interval = 50 * time.Millisecond
+	deadline := time.Now().Add(timeout + 2*interval)
+	var errs []error
+	for {
+		var pending []*mgr.Service
+		for _, s := range services {
+			status, err := s.Query()
+			switch {
+			case err != nil:
+				errs = append(errs, fmt.Errorf("%s: %w", s.Name, err))
+			case status.State != svc.Stopped:
+				pending = append(pending, s)
+			}
+		}
+		services = pending
+		if len(services) == 0 {
+			return errors.Join(errs...)
+		}
+		if time.Now().After(deadline) {
+			for _, s := range services {
+				errs = append(errs, fmt.Errorf("%s: did not stop within %v", s.Name, timeout))
+			}
+			return errors.Join(errs...)
+		}
+		time.Sleep(interval)
+	}
 }
 
 // getStopTimeout fetches the time before windows will kill the service.
