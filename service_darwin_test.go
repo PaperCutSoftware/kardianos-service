@@ -54,7 +54,7 @@ func TestDarwinLogDir(t *testing.T) {
 		want  string
 	}{
 		{ServiceLevelUser, nil, "/home/test"},
-		{ServiceLevelAllUsers, nil, defaultDarwinLogDirectory},
+		{ServiceLevelAllUsers, nil, ""},
 		{ServiceLevelSystem, nil, defaultDarwinLogDirectory},
 		{ServiceLevelUser, KeyValue{optionLogDirectory: "/custom"}, "/custom"},
 		{ServiceLevelAllUsers, KeyValue{optionLogDirectory: "/custom"}, "/custom"},
@@ -67,6 +67,56 @@ func TestDarwinLogDir(t *testing.T) {
 		}
 		if got != tt.want {
 			t.Errorf("%s %v: logDir = %q, want %q", tt.level, tt.opts, got, tt.want)
+		}
+	}
+}
+
+func TestDarwinLogPaths(t *testing.T) {
+	tests := []struct {
+		level   ServiceLevel
+		opts    KeyValue
+		wantOut string
+		wantErr string
+	}{
+		{ServiceLevelUser, nil, "/home/test/svc.out.log", "/home/test/svc.err.log"},
+		{ServiceLevelAllUsers, nil, "", ""},
+		{ServiceLevelSystem, nil, "/var/log/svc.out.log", "/var/log/svc.err.log"},
+		{ServiceLevelAllUsers, KeyValue{optionLogDirectory: "/custom"}, "/custom/svc.out.log", "/custom/svc.err.log"},
+	}
+	for _, tt := range tests {
+		out, errPath, err := newDarwinService(t, tt.level, tt.opts).getLogPaths()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != tt.wantOut || errPath != tt.wantErr {
+			t.Errorf("%s %v: log paths = %q, %q, want %q, %q", tt.level, tt.opts, out, errPath, tt.wantOut, tt.wantErr)
+		}
+	}
+}
+
+func TestDarwinPlistOmitsEmptyLogPaths(t *testing.T) {
+	out, err := launchdTemplate.render(map[string]any{
+		"Name":              "svc",
+		"Path":              "/bin/svc",
+		"Arguments":         []string(nil),
+		"ChRoot":            "",
+		"UserName":          "",
+		"WorkingDirectory":  "",
+		"EnvVars":           []string(nil),
+		"KeepAlive":         "true",
+		"RunAtLoad":         "false",
+		"SessionCreate":     "false",
+		"StandardOutPath":   "",
+		"StandardErrorPath": "",
+	}, launchdFuncs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// these must not be written out in the default case. see: logDir:service_darwin.go
+	for _, key := range []string{"StandardOutPath", "StandardErrorPath"} {
+		if strings.Contains(out, key) {
+			t.Errorf("plist contains %s:\n%s", key, out)
 		}
 	}
 }

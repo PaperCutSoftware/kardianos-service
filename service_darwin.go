@@ -123,19 +123,27 @@ func (s *darwinLaunchdService) getServiceFilePath() (string, error) {
 	}
 }
 
+// logDir returns the directory for launchd's stdout and stderr files, or ""
+// for none.
 func (s *darwinLaunchdService) logDir() (string, error) {
 	if customDir := s.Option.string(optionLogDirectory, ""); customDir != "" {
 		return customDir, nil
 	}
-	if s.level == ServiceLevelUser {
+	switch s.level {
+	case ServiceLevelUser:
 		return userHomeDir()
+	case ServiceLevelAllUsers:
+		// default log location is not writable by users
+		// launchd will fail to spawn as a result
+		// TODO: sort out a way to redirect logs at runtime in the default case
+		return "", nil
 	}
 	return defaultDarwinLogDirectory, nil
 }
 
 func (s *darwinLaunchdService) getLogPaths() (string, string, error) {
 	logDir, err := s.logDir()
-	if err != nil {
+	if err != nil || logDir == "" {
 		return "", "", err
 	}
 	return s.getLogPath(logDir, "out"), s.getLogPath(logDir, "err"), nil
