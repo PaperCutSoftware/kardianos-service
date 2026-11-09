@@ -71,7 +71,7 @@ const (
 	optionKeepAliveDefault     = true
 	optionRunAtLoad            = "RunAtLoad"
 	optionRunAtLoadDefault     = false
-	optionUserService          = "UserService"
+	optionUserService          = "UserService" // deprecated, use ServiceLevel instead
 	optionUserServiceDefault   = false
 	optionSessionCreate        = "SessionCreate"
 	optionSessionCreateDefault = false
@@ -109,7 +109,7 @@ const (
 	StatusStopped
 )
 
-// ServiceLevel selects who the service is installed for.
+// The level that the Service will run as
 type ServiceLevel string
 
 const (
@@ -149,8 +149,8 @@ type Config struct {
 
 	EnvVars map[string]string
 
-	// ServiceLevel selects who the service is installed for.
-	// Defaults to ServiceLevelSystem when empty.
+	// The level that the service will run as.
+	// Defaults to a System service
 	ServiceLevel ServiceLevel
 }
 

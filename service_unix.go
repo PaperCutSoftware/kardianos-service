@@ -74,6 +74,14 @@ var runCommand = execCommand
 // isPrivileged reports whether the process runs as root. Replaced in tests.
 var isPrivileged = func() bool { return os.Geteuid() == 0 } //nolint:unused // Used by AllUsers on darwin and systemd.
 
+func (c *Config) userServiceLevel() (ServiceLevel, error) {
+	// fallback to the deprecated UserService level if ServiceLevel isn't defined
+	if c.ServiceLevel == "" && c.Option.bool(optionUserService, optionUserServiceDefault) {
+		return ServiceLevelUser, nil
+	}
+	return c.serviceLevel()
+}
+
 func execCommand(command string, readStdout bool, arguments ...string) (int, string, error) {
 	cmd := exec.Command(command, arguments...)
 

@@ -27,6 +27,35 @@ func newDarwinService(t *testing.T, level ServiceLevel, opts KeyValue) *darwinLa
 	return s.(*darwinLaunchdService)
 }
 
+func TestDarwinLegacyUserService(t *testing.T) {
+	tests := []struct {
+		level       ServiceLevel
+		userService bool
+		want        ServiceLevel
+		wantErr     bool
+	}{
+		{level: "", userService: true, want: ServiceLevelUser},
+		{level: ServiceLevelUser, userService: true, want: ServiceLevelUser},
+		{level: ServiceLevelSystem, userService: true, want: ServiceLevelSystem},
+		{level: ServiceLevelAllUsers, userService: true, want: ServiceLevelAllUsers},
+		{level: "", userService: false, want: ServiceLevelSystem},
+	}
+	for _, tt := range tests {
+		c := &Config{Name: "svc", ServiceLevel: tt.level, Option: KeyValue{optionUserService: tt.userService}}
+		s, err := darwinSystem{}.New(nil, c)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("level %q, UserService %v: error = %v, wantErr %v", tt.level, tt.userService, err, tt.wantErr)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		if got := s.(*darwinLaunchdService).level; got != tt.want {
+			t.Errorf("level %q, UserService %v: level = %q, want %q", tt.level, tt.userService, got, tt.want)
+		}
+	}
+}
+
 func TestDarwinServiceFilePath(t *testing.T) {
 	tests := []struct {
 		level ServiceLevel

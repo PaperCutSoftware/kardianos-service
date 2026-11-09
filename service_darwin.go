@@ -41,7 +41,7 @@ func (darwinSystem) Interactive() bool {
 }
 
 func (darwinSystem) New(i Interface, c *Config) (Service, error) {
-	level, err := c.serviceLevel()
+	level, err := c.userServiceLevel()
 	if err != nil {
 		return nil, err
 	}
