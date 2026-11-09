@@ -205,7 +205,8 @@ func (s *darwinLaunchdService) Install() error {
 		return err
 	}
 	if s.level == ServiceLevelAllUsers {
-		if err := checkExecutableOwnership(path); err != nil {
+		path, err = checkExecutableOwnership(path)
+		if err != nil {
 			return err
 		}
 	}

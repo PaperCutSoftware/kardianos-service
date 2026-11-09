@@ -74,11 +74,28 @@ func TestOwnershipWalk(t *testing.T) {
 			seen = append(seen, path)
 			return 0, 0, 0755, nil
 		})
-		if err := checkExecutableOwnership(file); err != nil {
+		if _, err := checkExecutableOwnership(file); err != nil {
 			t.Fatal(err)
 		}
 		if strings.Join(seen, "\n") != strings.Join(want, "\n") {
 			t.Errorf("checked %q, want %q", seen, want)
+		}
+	})
+
+	t.Run("returns resolved path", func(t *testing.T) {
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(file, link); err != nil {
+			t.Fatal(err)
+		}
+		stubOwnerStat(t, func(path string) (uint32, uint32, os.FileMode, error) {
+			return 0, 0, 0755, nil
+		})
+		got, err := checkExecutableOwnership(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != file {
+			t.Errorf("path = %q, want %q", got, file)
 		}
 	})
 
@@ -90,7 +107,7 @@ func TestOwnershipWalk(t *testing.T) {
 			}
 			return 0, 0, 0755, nil
 		})
-		err := checkExecutableOwnership(file)
+		_, err := checkExecutableOwnership(file)
 		if err == nil || !strings.HasPrefix(err.Error(), b+":") {
 			t.Errorf("err = %v, want it to name %s", err, b)
 		}
@@ -101,7 +118,7 @@ func TestOwnershipWalk(t *testing.T) {
 		stubOwnerStat(t, func(path string) (uint32, uint32, os.FileMode, error) {
 			return 0, 0, 0, statErr
 		})
-		if err := checkExecutableOwnership(file); !errors.Is(err, statErr) {
+		if _, err := checkExecutableOwnership(file); !errors.Is(err, statErr) {
 			t.Errorf("err = %v, want %v", err, statErr)
 		}
 	})
@@ -120,10 +137,10 @@ func TestOwnershipRealFS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := checkExecutableOwnership(target); err == nil {
+	if _, err := checkExecutableOwnership(target); err == nil {
 		t.Error("user-owned file passed")
 	}
-	err := checkExecutableOwnership(link)
+	_, err := checkExecutableOwnership(link)
 	if err == nil || !strings.Contains(err.Error(), "target:") {
 		t.Errorf("err = %v, want it to name the resolved target", err)
 	}

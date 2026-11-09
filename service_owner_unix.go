@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"syscall"
 )
 
@@ -19,30 +20,30 @@ var trustedGroups = func() []uint32 {
 	return []uint32{0}
 }()
 
-// checkExecutableOwnership returns an error if path, or any directory above
-// it, can be modified by someone other than root or an admin group.
-func checkExecutableOwnership(path string) error {
+// checkExecutableOwnership returns the resolved path, and  ensures that files
+// aren't writable by non-root users
+func checkExecutableOwnership(path string) (string, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
-		return err
+		return "", err
 	}
-	path, err = filepath.EvalSymlinks(path)
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return err
+		return "", err
 	}
-	for {
-		uid, gid, mode, err := ownerStat(path)
+	for p := resolved; ; {
+		uid, gid, mode, err := ownerStat(p)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if !trusted(uid, gid, mode) {
-			return fmt.Errorf("%s: writable by non-admin users", path)
+			return "", fmt.Errorf("%s: writable by non-admin users", p)
 		}
-		parent := filepath.Dir(path)
-		if parent == path {
-			return nil
+		parent := filepath.Dir(p)
+		if parent == p {
+			return resolved, nil
 		}
-		path = parent
+		p = parent
 	}
 }
 
@@ -55,12 +56,8 @@ func trusted(uid, gid uint32, mode os.FileMode) bool {
 	if mode&0020 == 0 {
 		return true
 	}
-	for _, g := range trustedGroups {
-		if gid == g {
-			return true
-		}
-	}
-	return false
+
+	return slices.Contains(trustedGroups, gid)
 }
 
 // ownerStat returns the owner, group and mode of path. Replaced in tests.

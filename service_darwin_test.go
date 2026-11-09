@@ -184,6 +184,43 @@ func TestAllUsersInstallRequiresPrivilege(t *testing.T) {
 	}
 }
 
+func TestAllUsersInstallWritesResolvedPath(t *testing.T) {
+	stubPrivileged(t, true)
+	recordCommands(t, nil)
+	stubOwnerStat(t, func(path string) (uint32, uint32, os.FileMode, error) {
+		return 0, 0, 0755, nil
+	})
+	target := filepath.Join(t.TempDir(), "app")
+	if err := os.WriteFile(target, nil, 0755); err != nil {
+		t.Fatal(err)
+	}
+	target, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "app")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	s := newDarwinService(t, ServiceLevelAllUsers, nil)
+	s.Executable = link
+	dir := stubLibraryDir(t)
+
+	if err := s.Install(); err != nil {
+		t.Fatal(err)
+	}
+	plist, err := os.ReadFile(filepath.Join(dir, "LaunchAgents", "svc.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(plist), "<string>"+target+"</string>") {
+		t.Errorf("plist does not run %s:\n%s", target, plist)
+	}
+	if strings.Contains(string(plist), link) {
+		t.Errorf("plist contains symlink %s:\n%s", link, plist)
+	}
+}
+
 func TestAllUsersUninstallRequiresPrivilege(t *testing.T) {
 	stubPrivileged(t, false)
 	calls := recordCommands(t, nil)

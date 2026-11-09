@@ -5,7 +5,7 @@ package service
 import "testing"
 
 func TestOwnershipRootOwned(t *testing.T) {
-	if err := checkExecutableOwnership("/bin/sh"); err != nil {
+	if _, err := checkExecutableOwnership("/bin/sh"); err != nil {
 		t.Error(err)
 	}
 }
