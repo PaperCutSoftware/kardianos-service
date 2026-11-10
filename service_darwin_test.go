@@ -265,14 +265,16 @@ func TestAllUsersCommandsRefuseWhenPrivileged(t *testing.T) {
 
 func TestDarwinAllUsersUninstallSkipsStop(t *testing.T) {
 	stubPrivileged(t, true)
+	gui := fmt.Sprintf("gui/%d", os.Getuid())
 	tests := []struct {
 		level    ServiceLevel
 		plist    string
+		domain   string
 		wantStop bool
 	}{
-		{ServiceLevelAllUsers, "LaunchAgents/svc.plist", false},
-		{ServiceLevelSystem, "LaunchDaemons/svc.plist", true},
-		{ServiceLevelUser, "Library/LaunchAgents/svc.plist", true},
+		{ServiceLevelAllUsers, "LaunchAgents/svc.plist", gui, false},
+		{ServiceLevelSystem, "LaunchDaemons/svc.plist", "system", true},
+		{ServiceLevelUser, "Library/LaunchAgents/svc.plist", gui, true},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.level), func(t *testing.T) {
@@ -286,14 +288,15 @@ func TestDarwinAllUsersUninstallSkipsStop(t *testing.T) {
 			if err := s.Uninstall(); err != nil {
 				t.Fatal(err)
 			}
+			bootout := "launchctl bootout " + tt.domain + "/svc"
 			stopped := false
 			for _, c := range *calls {
-				if len(c) == 3 && c[0] == "launchctl" && c[1] == "unload" && c[2] == plist {
+				if strings.Join(c, " ") == bootout {
 					stopped = true
 				}
 			}
 			if stopped != tt.wantStop {
-				t.Errorf("launchctl unload ran = %v, want %v (calls %q)", stopped, tt.wantStop, *calls)
+				t.Errorf("%s ran = %v, want %v (calls %q)", bootout, stopped, tt.wantStop, *calls)
 			}
 			if _, err := os.Stat(plist); !os.IsNotExist(err) {
 				t.Errorf("plist not removed: %v", err)
@@ -302,23 +305,41 @@ func TestDarwinAllUsersUninstallSkipsStop(t *testing.T) {
 	}
 }
 
-func TestDarwinStopCommand(t *testing.T) {
-	stubPrivileged(t, false)
-	tests := []struct {
-		level ServiceLevel
-		want  string
-	}{
-		// AllUsers stops by label, because Uninstall may have removed the plist.
-		{ServiceLevelAllUsers, "launchctl remove svc"},
-		{ServiceLevelSystem, "launchctl unload /Library/LaunchDaemons/svc.plist"},
+func TestDarwinStop(t *testing.T) {
+	gui := fmt.Sprintf("gui/%d", os.Getuid())
+	domains := map[ServiceLevel]string{
+		ServiceLevelSystem:   "system",
+		ServiceLevelUser:     gui,
+		ServiceLevelAllUsers: gui,
 	}
-	for _, tt := range tests {
-		calls := recordCommands(t, nil)
-		if err := newDarwinService(t, tt.level, nil).Stop(); err != nil {
-			t.Fatal(err)
-		}
-		if len(*calls) != 1 || strings.Join((*calls)[0], " ") != tt.want {
-			t.Errorf("%s: ran %q, want %q", tt.level, *calls, tt.want)
+	bootoutErr := errors.New("Boot-out failed: 5: Input/output error")
+	tests := []struct {
+		name    string
+		code    int
+		err     error
+		wantErr error
+	}{
+		{name: "loaded"},
+		{name: "not loaded", code: launchctlNoSuchProcess, err: errors.New("Boot-out failed: 3: No such process")},
+		{name: "fails", code: 5, err: bootoutErr, wantErr: bootoutErr},
+	}
+	for level, domain := range domains {
+		for _, tt := range tests {
+			t.Run(string(level)+"/"+tt.name, func(t *testing.T) {
+				stubPrivileged(t, level == ServiceLevelSystem)
+				calls := stubCommands(t, func(argv []string) (int, string, error) {
+					return tt.code, "", tt.err
+				})
+
+				err := newDarwinService(t, level, nil).Stop()
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("Stop err = %v, want %v", err, tt.wantErr)
+				}
+				want := "launchctl bootout " + domain + "/svc"
+				if len(*calls) != 1 || strings.Join((*calls)[0], " ") != want {
+					t.Errorf("ran %q, want %q", *calls, want)
+				}
+			})
 		}
 	}
 }
@@ -414,14 +435,20 @@ func TestDarwinStopAllCommands(t *testing.T) {
 
 func TestDarwinStartAllCommands(t *testing.T) {
 	stubPrivileged(t, true)
-	// User 501's copy is loaded, so kickstart starts it. User 502's isn't, so
-	// it is bootstrapped.
+	var mu sync.Mutex
+	bootstrapped := false
 	calls := stubCommands(t, func(argv []string) (int, string, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		switch strings.Join(argv, " ") {
 		case psGUIUsers:
 			return 0, guiUsersPS, nil
+		case "launchctl bootstrap gui/502 /Library/LaunchAgents/svc.plist":
+			bootstrapped = true
 		case "launchctl kickstart gui/502/svc":
-			return launchctlNotFound, "", errors.New(`Could not find service "svc"`)
+			if !bootstrapped {
+				return launchctlNotFound, "", errors.New(`Could not find service "svc"`)
+			}
 		}
 		return 0, "", nil
 	})
@@ -429,14 +456,79 @@ func TestDarwinStartAllCommands(t *testing.T) {
 	if err := newDarwinService(t, ServiceLevelAllUsers, nil).StartAll(); err != nil {
 		t.Fatal(err)
 	}
+	// not ordered
 	want := []string{
 		"launchctl bootstrap gui/502 /Library/LaunchAgents/svc.plist",
 		"launchctl kickstart gui/501/svc",
 		"launchctl kickstart gui/502/svc",
+		"launchctl kickstart gui/502/svc",
 		psGUIUsers,
 	}
+	sort.Strings(want)
 	if got := joinCalls(*calls); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("ran %q, want %q", got, want)
+	}
+}
+
+func TestDarwinStart(t *testing.T) {
+	gui := fmt.Sprintf("gui/%d", os.Getuid())
+	domains := map[ServiceLevel]string{
+		ServiceLevelSystem:   "system",
+		ServiceLevelUser:     gui,
+		ServiceLevelAllUsers: gui,
+	}
+	bootstrapErr := errors.New("Bootstrap failed: 5: Input/output error")
+	for level, domain := range domains {
+		s := newDarwinService(t, level, nil)
+		confPath, err := s.getServiceFilePath()
+		if err != nil {
+			t.Fatal(err)
+		}
+		kickstart := "launchctl kickstart " + domain + "/svc"
+		bootstrap := "launchctl bootstrap " + domain + " " + confPath
+
+		tests := []struct {
+			name      string
+			loaded    bool
+			bootstrap error
+			want      []string
+		}{
+			{name: "loaded", loaded: true, want: []string{kickstart}},
+			{name: "not loaded", want: []string{kickstart, bootstrap, kickstart}},
+			{name: "bootstrap fails", bootstrap: bootstrapErr, want: []string{kickstart, bootstrap}},
+		}
+		for _, tt := range tests {
+			t.Run(string(level)+"/"+tt.name, func(t *testing.T) {
+				stubPrivileged(t, level == ServiceLevelSystem)
+				loaded := tt.loaded
+				calls := stubCommands(t, func(argv []string) (int, string, error) {
+					switch strings.Join(argv, " ") {
+					case bootstrap:
+						if tt.bootstrap != nil {
+							return 5, "", tt.bootstrap
+						}
+						loaded = true
+					case kickstart:
+						if !loaded {
+							return launchctlNotFound, "", errors.New(`Could not find service "svc"`)
+						}
+					}
+					return 0, "", nil
+				})
+
+				err := s.Start()
+				if !errors.Is(err, tt.bootstrap) {
+					t.Errorf("Start err = %v, want %v", err, tt.bootstrap)
+				}
+				var got []string
+				for _, c := range *calls {
+					got = append(got, strings.Join(c, " "))
+				}
+				if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+					t.Errorf("ran %q, want %q", got, tt.want)
+				}
+			})
+		}
 	}
 }
 
@@ -446,13 +538,13 @@ func TestDarwinAllCommandsReturnErrors(t *testing.T) {
 		if strings.Join(argv, " ") == psGUIUsers {
 			return 0, guiUsersPS, nil
 		}
-		return 1, "", errors.New("failed: " + argv[len(argv)-1])
+		return 1, "", errors.New("failed")
 	})
 	s := newDarwinService(t, ServiceLevelAllUsers, nil)
 
 	for name, cmd := range map[string]func() error{"StartAll": s.StartAll, "StopAll": s.StopAll} {
 		err := cmd()
-		if err == nil || !strings.Contains(err.Error(), "501") || !strings.Contains(err.Error(), "502") {
+		if err == nil || !strings.Contains(err.Error(), "gui/501: failed") || !strings.Contains(err.Error(), "gui/502: failed") {
 			t.Errorf("%s err = %v, want both users' failures", name, err)
 		}
 	}
@@ -496,13 +588,12 @@ func TestDarwinAllCommandsRunConcurrently(t *testing.T) {
 	}
 }
 
-// joinCalls returns each recorded call's argv joined with spaces, sorted,
-// because each user's commands run concurrently.
 func joinCalls(calls [][]string) []string {
 	var out []string
 	for _, c := range calls {
 		out = append(out, strings.Join(c, " "))
 	}
+	// calls are run concurrently, so there's no guarantee of order
 	sort.Strings(out)
 	return out
 }

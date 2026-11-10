@@ -336,22 +336,45 @@ func (s *darwinLaunchdService) Start() error {
 	if err != nil {
 		return err
 	}
-	return run("launchctl", "load", confPath)
+	return s.startIn(s.domain(), confPath)
+}
+
+func (s *darwinLaunchdService) domain() string {
+	if s.level == ServiceLevelSystem {
+		return "system"
+	}
+	return fmt.Sprintf("gui/%d", os.Getuid())
+}
+
+func (s *darwinLaunchdService) startIn(domain, confPath string) error {
+	target := domain + "/" + s.Name
+	code, _, err := runWithOutput("launchctl", "kickstart", target)
+	if code == launchctlNotFound {
+		err = run("launchctl", "bootstrap", domain, confPath)
+		// we still need to start the service after bootstrapping
+		if err == nil {
+			err = run("launchctl", "kickstart", target)
+		}
+	}
+	return err
 }
 
 func (s *darwinLaunchdService) Stop() error {
 	if err := s.userContextRequired(); err != nil {
 		return err
 	}
-	if s.level == ServiceLevelAllUsers {
-		// Uninstall leaves running copies, so the plist may be gone. Stop by label.
-		return run("launchctl", "remove", s.Name)
+
+	// plist is not guaranteed to exist, as uninstall removes it
+	// stop by name instead
+	return s.stopIn(s.domain())
+}
+
+func (s *darwinLaunchdService) stopIn(domain string) error {
+	code, _, err := runWithOutput("launchctl", "bootout", domain+"/"+s.Name)
+	if code == launchctlNoSuchProcess {
+		return nil
 	}
-	confPath, err := s.getServiceFilePath()
-	if err != nil {
-		return err
-	}
-	return run("launchctl", "unload", confPath)
+	return err
 }
 
 func (s *darwinLaunchdService) Restart() error {
@@ -380,14 +403,7 @@ func (s *darwinLaunchdService) StartAll() error {
 		return err
 	}
 	return forEachUser(uids, func(uid uint32) error {
-		domain := fmt.Sprintf("gui/%d", uid)
-		// kickstart does nothing to a running copy
-		// we also can't use bootstrap as a blanket command
-		code, _, err := runWithOutput("launchctl", "kickstart", domain+"/"+s.Name)
-		if code == launchctlNotFound {
-			err = run("launchctl", "bootstrap", domain, confPath)
-		}
-		return err
+		return s.startIn(fmt.Sprintf("gui/%d", uid), confPath)
 	})
 }
 
@@ -399,11 +415,7 @@ func (s *darwinLaunchdService) StopAll() error {
 		return err
 	}
 	return forEachUser(uids, func(uid uint32) error {
-		code, _, err := runWithOutput("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, s.Name))
-		if code == launchctlNoSuchProcess {
-			return nil
-		}
-		return err
+		return s.stopIn(fmt.Sprintf("gui/%d", uid))
 	})
 }
 
@@ -416,7 +428,9 @@ func forEachUser(uids []uint32, f func(uid uint32) error) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = f(uid)
+			if err := f(uid); err != nil {
+				errs[i] = fmt.Errorf("gui/%d: %w", uid, err)
+			}
 		}()
 	}
 	wg.Wait()
