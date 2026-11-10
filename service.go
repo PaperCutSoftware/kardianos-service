@@ -141,7 +141,7 @@ type Config struct {
 	Dependencies []string
 
 	// The following fields are not supported on Windows.
-	WorkingDirectory string // Initial working directory.
+	WorkingDirectory string // Initial working directory. For AllUsers, it must be readable by every user.
 	ChRoot           string
 
 	// System specific options.

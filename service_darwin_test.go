@@ -56,6 +56,33 @@ func TestDarwinLegacyUserService(t *testing.T) {
 	}
 }
 
+func TestDarwinAllUsersOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  Config
+		wantErr bool
+	}{
+		{name: "UserName", config: Config{UserName: "bob"}, wantErr: true},
+		{name: "ChRoot", config: Config{ChRoot: "/jail"}, wantErr: true},
+		{name: "LogDirectory", config: Config{Option: KeyValue{optionLogDirectory: "/var/log"}}, wantErr: true},
+		{name: "SessionCreate", config: Config{Option: KeyValue{optionSessionCreate: true}}, wantErr: true},
+		{name: "SessionCreate false", config: Config{Option: KeyValue{optionSessionCreate: false}}},
+		{name: "EnvVars", config: Config{EnvVars: map[string]string{"KEY": "value"}}},
+	}
+	for _, tt := range tests {
+		for _, level := range []ServiceLevel{ServiceLevelAllUsers, ServiceLevelUser, ServiceLevelSystem} {
+			c := tt.config
+			c.Name = "svc"
+			c.ServiceLevel = level
+			_, err := darwinSystem{}.New(nil, &c)
+			wantErr := tt.wantErr && level == ServiceLevelAllUsers
+			if (err != nil) != wantErr {
+				t.Errorf("%s at %s: error = %v, wantErr %v", tt.name, level, err, wantErr)
+			}
+		}
+	}
+}
+
 func TestDarwinServiceFilePath(t *testing.T) {
 	tests := []struct {
 		level ServiceLevel
@@ -86,7 +113,6 @@ func TestDarwinLogDir(t *testing.T) {
 		{ServiceLevelAllUsers, nil, ""},
 		{ServiceLevelSystem, nil, defaultDarwinLogDirectory},
 		{ServiceLevelUser, KeyValue{optionLogDirectory: "/custom"}, "/custom"},
-		{ServiceLevelAllUsers, KeyValue{optionLogDirectory: "/custom"}, "/custom"},
 		{ServiceLevelSystem, KeyValue{optionLogDirectory: "/custom"}, "/custom"},
 	}
 	for _, tt := range tests {
@@ -110,7 +136,7 @@ func TestDarwinLogPaths(t *testing.T) {
 		{ServiceLevelUser, nil, "/home/test/svc.out.log", "/home/test/svc.err.log"},
 		{ServiceLevelAllUsers, nil, "", ""},
 		{ServiceLevelSystem, nil, "/var/log/svc.out.log", "/var/log/svc.err.log"},
-		{ServiceLevelAllUsers, KeyValue{optionLogDirectory: "/custom"}, "/custom/svc.out.log", "/custom/svc.err.log"},
+		{ServiceLevelSystem, KeyValue{optionLogDirectory: "/custom"}, "/custom/svc.out.log", "/custom/svc.err.log"},
 	}
 	for _, tt := range tests {
 		out, errPath, err := newDarwinService(t, tt.level, tt.opts).getLogPaths()

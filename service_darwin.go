@@ -45,6 +45,10 @@ func (darwinSystem) New(i Interface, c *Config) (Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	if level == ServiceLevelAllUsers && (c.UserName != "" || c.ChRoot != "" ||
+		c.Option.string(optionLogDirectory, "") != "" || c.Option.bool(optionSessionCreate, optionSessionCreateDefault)) {
+		return nil, errors.New("AllUsers services run as the logged-in user and cannot set UserName, ChRoot, LogDirectory or SessionCreate")
+	}
 	s := &darwinLaunchdService{
 		i:      i,
 		Config: c,
