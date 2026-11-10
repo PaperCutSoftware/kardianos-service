@@ -602,12 +602,6 @@ type instanceState struct {
 	pid   uint32
 }
 
-// determines if the name is a per-user service instance of the template service
-func isInstanceOf(name, template string) bool {
-	prefix := template + "_"
-	return len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) && isHex(name[len(prefix):])
-}
-
 func isHex(s string) bool {
 	if s == "" {
 		return false
@@ -622,34 +616,25 @@ func isHex(s string) bool {
 
 // listInstances lists all instances with their state and process ID
 func listInstances(m *mgr.Mgr, template string) ([]instanceState, error) {
-	names, err := m.ListServices()
+	services, err := listServices(m)
 	if err != nil {
 		return nil, err
 	}
-	var instances []instanceState
-	for _, name := range names {
-		if !isInstanceOf(name, template) {
-			continue
-		}
-		status, err := queryService(m, name)
-		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
-		}
-		instances = append(instances, instanceState{name, status.State, status.ProcessId})
-	}
-	return instances, nil
+	return instancesOf(services, template), nil
 }
 
-func queryService(m *mgr.Mgr, name string) (svc.Status, error) {
-	s, err := openService(m, name, windows.SERVICE_QUERY_STATUS)
-	if err != nil {
-		return svc.Status{}, err
+func instancesOf(services []serviceState, template string) []instanceState {
+	prefix := template + "_"
+	var instances []instanceState
+	for _, s := range services {
+		// we can't solely rely on name matching, so check the service type as well
+		if s.typ&serviceUserServiceInstance == 0 || len(s.name) < len(prefix) ||
+			!strings.EqualFold(s.name[:len(prefix)], prefix) || !isHex(s.name[len(prefix):]) {
+			continue
+		}
+		instances = append(instances, instanceState{s.name, svc.State(s.state), s.pid})
 	}
-	defer s.Close()
-	return s.Query()
+	return instances
 }
 
 // mockable for tests

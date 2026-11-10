@@ -133,22 +133,33 @@ func TestWindowsAllUsersCommandsRequirePrivilege(t *testing.T) {
 	}
 }
 
-func TestWindowsIsInstanceOf(t *testing.T) {
+func TestWindowsInstancesOf(t *testing.T) {
+	const instance = serviceUserServiceInstance | serviceUserOwnProcess
 	tests := []struct {
-		name string
-		want bool
+		reason  string
+		service serviceState
+		want    bool
 	}{
-		{"Svc_3c4a5", true},
-		{"svc_3C4A5", true},
-		{"Svc_3c4a5f0", true},
-		{"Svc", false},
-		{"Svc_", false},
-		{"SvcX_3c4a5", false},
-		{"Svc_Other", false},
+		{"instance", serviceState{"Svc_3c4a5", instance, windows.SERVICE_RUNNING, 20}, true},
+		{"name case differs", serviceState{"svc_3C4A5", instance, windows.SERVICE_RUNNING, 20}, true},
+		{"longer suffix", serviceState{"Svc_3c4a5f0", instance, windows.SERVICE_RUNNING, 20}, true},
+		{"keeps state", serviceState{"Svc_bb", instance, windows.SERVICE_STOP_PENDING, 50}, true},
+		{"no instance bit", serviceState{"Svc_db", windows.SERVICE_WIN32_OWN_PROCESS, windows.SERVICE_RUNNING, 10}, false},
+		{"template", serviceState{"Svc", serviceUserOwnProcess, windows.SERVICE_STOPPED, 0}, false},
+		{"empty suffix", serviceState{"Svc_", instance, windows.SERVICE_RUNNING, 20}, false},
+		{"other template", serviceState{"SvcX_aa", instance, windows.SERVICE_RUNNING, 30}, false},
+		{"non-hex suffix", serviceState{"Svc_Other", instance, windows.SERVICE_RUNNING, 20}, false},
+		{"other template's instance", serviceState{"Svc_helper_aa", instance, windows.SERVICE_RUNNING, 40}, false},
 	}
 	for _, tt := range tests {
-		if got := isInstanceOf(tt.name, "Svc"); got != tt.want {
-			t.Errorf("isInstanceOf(%q, Svc) = %v, want %v", tt.name, got, tt.want)
+		got := instancesOf([]serviceState{tt.service}, "Svc")
+		if (len(got) == 1) != tt.want {
+			t.Errorf("%s: instancesOf(%q) = %v, want included %v", tt.reason, tt.service.name, got, tt.want)
+			continue
+		}
+		want := instanceState{tt.service.name, svc.State(tt.service.state), tt.service.pid}
+		if tt.want && got[0] != want {
+			t.Errorf("%s: instancesOf(%q) = %v, want %v", tt.reason, tt.service.name, got[0], want)
 		}
 	}
 }
