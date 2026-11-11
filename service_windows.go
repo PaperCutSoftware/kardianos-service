@@ -647,6 +647,8 @@ var processSession = func(pid uint32) (uint32, error) {
 
 var errNoSessionInstance = errors.New("the service has no instance in this session until the next logon")
 
+var errNonInteractiveSession = errors.New("per-user instances only exist in interactive logon sessions")
+
 var errInstanceStopping = errors.New("the instance is stopping; try again once it has stopped")
 
 func ownInstance(services []serviceState, template string, session uint32) (serviceState, bool, error) {
@@ -659,6 +661,9 @@ func ownInstance(services []serviceState, template string, session uint32) (serv
 	}
 	if !installed {
 		return serviceState{}, false, ErrNotInstalled
+	}
+	if session == 0 {
+		return serviceState{}, false, errNonInteractiveSession
 	}
 
 	instances := instancesOf(services, template)
@@ -674,7 +679,7 @@ func ownInstance(services []serviceState, template string, session uint32) (serv
 	}
 
 	// We can't find a stopped instance on its own. We need to derive the
-	// user suffix from a different running process.
+	// user suffix from any other per-user service running in this session
 	suffix, ok := logonSuffix(services, session)
 	if !ok {
 		return serviceState{}, false, nil

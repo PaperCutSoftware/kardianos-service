@@ -201,6 +201,13 @@ func TestWindowsOwnInstance(t *testing.T) {
 			t.Errorf("%s: ownInstance = %v, %v, %v, want %v, %v, %v", tt.name, got, found, err, tt.want, tt.found, tt.err)
 		}
 	}
+
+	if _, _, err := ownInstance([]serviceState{template, running}, "Svc", 0); !errors.Is(err, errNonInteractiveSession) {
+		t.Errorf("session 0: err = %v, want %v", err, errNonInteractiveSession)
+	}
+	if _, _, err := ownInstance([]serviceState{running}, "Svc", 0); !errors.Is(err, ErrNotInstalled) {
+		t.Errorf("session 0, not installed: err = %v, want %v", err, ErrNotInstalled)
+	}
 }
 
 func TestAllUsersAllCommandsRequirePrivilege(t *testing.T) {
