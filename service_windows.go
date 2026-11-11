@@ -596,9 +596,10 @@ func (ws *windowsService) stopWait(s *mgr.Service) error {
 // Users aren't given the required permissions to Start, Stop and Restart their
 // services, but they can query their status.
 
-type instanceState struct {
+type serviceState struct {
 	name  string
-	state svc.State
+	typ   uint32
+	state uint32
 	pid   uint32
 }
 
@@ -615,7 +616,7 @@ func isHex(s string) bool {
 }
 
 // listInstances lists all instances with their state and process ID
-func listInstances(m *mgr.Mgr, template string) ([]instanceState, error) {
+func listInstances(m *mgr.Mgr, template string) ([]serviceState, error) {
 	services, err := listServices(m)
 	if err != nil {
 		return nil, err
@@ -623,16 +624,16 @@ func listInstances(m *mgr.Mgr, template string) ([]instanceState, error) {
 	return instancesOf(services, template), nil
 }
 
-func instancesOf(services []serviceState, template string) []instanceState {
+func instancesOf(services []serviceState, template string) []serviceState {
 	prefix := template + "_"
-	var instances []instanceState
+	var instances []serviceState
 	for _, s := range services {
 		// we can't solely rely on name matching, so check the service type as well
 		if s.typ&serviceUserServiceInstance == 0 || len(s.name) < len(prefix) ||
 			!strings.EqualFold(s.name[:len(prefix)], prefix) || !isHex(s.name[len(prefix):]) {
 			continue
 		}
-		instances = append(instances, instanceState{s.name, svc.State(s.state), s.pid})
+		instances = append(instances, s)
 	}
 	return instances
 }
@@ -644,106 +645,140 @@ var processSession = func(pid uint32) (uint32, error) {
 	return session, err
 }
 
-func ownRunningInstance(instances []instanceState, session uint32) (string, bool) {
+var errNoSessionInstance = errors.New("the service has no instance in this session until the next logon")
+
+var errInstanceStopping = errors.New("the instance is stopping; try again once it has stopped")
+
+func ownInstance(services []serviceState, template string, session uint32) (serviceState, bool, error) {
+	installed := false
+	for _, s := range services {
+		if strings.EqualFold(s.name, template) {
+			installed = true
+			break
+		}
+	}
+	if !installed {
+		return serviceState{}, false, ErrNotInstalled
+	}
+
+	instances := instancesOf(services, template)
 	for _, in := range instances {
 		if in.pid == 0 {
 			continue
 		}
-
 		// we can't read another user's session, so any successful reads are
 		// guaranteed to be ours
 		if s, err := processSession(in.pid); err == nil && s == session {
-			return in.name, true
+			return in, true, nil
 		}
 	}
-	return "", false
+
+	// We can't find a stopped instance on its own. We need to derive the
+	// user suffix from a different running process.
+	suffix, ok := logonSuffix(services, session)
+	if !ok {
+		return serviceState{}, false, nil
+	}
+	for _, in := range instances {
+		if strings.EqualFold(in.name, template+"_"+suffix) {
+			return in, true, nil
+		}
+	}
+	return serviceState{}, false, nil
 }
 
-func (ws *windowsService) ownInstance(m *mgr.Mgr) (name string, running bool, err error) {
-	t, err := openService(m, ws.Name, windows.SERVICE_QUERY_STATUS)
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return "", false, ErrNotInstalled
-	}
+func (ws *windowsService) sessionInstance() (*mgr.Mgr, serviceState, bool, error) {
+	m, err := lowPrivMgr()
 	if err != nil {
-		return "", false, err
+		return nil, serviceState{}, false, err
 	}
-	t.Close()
-
-	instances, err := listInstances(m, ws.Name)
+	services, err := listServices(m)
 	if err != nil {
-		return "", false, err
+		m.Disconnect()
+		return nil, serviceState{}, false, err
 	}
 	session, err := processSession(windows.GetCurrentProcessId())
 	if err != nil {
-		return "", false, err
+		m.Disconnect()
+		return nil, serviceState{}, false, err
 	}
-	name, running = ownRunningInstance(instances, session)
-	return name, running, nil
+	in, found, err := ownInstance(services, ws.Name, session)
+	if err != nil {
+		m.Disconnect()
+		return nil, serviceState{}, false, err
+	}
+	return m, in, found, nil
 }
 
 func (ws *windowsService) allUsersStatus() (Status, error) {
-	m, err := lowPrivMgr()
+	m, in, found, err := ws.sessionInstance()
 	if err != nil {
 		return StatusUnknown, err
 	}
-	defer m.Disconnect()
+	m.Disconnect()
 
-	_, running, err := ws.ownInstance(m)
-	if err != nil {
-		return StatusUnknown, err
+	if !found || in.state == windows.SERVICE_STOPPED || in.state == windows.SERVICE_STOP_PENDING {
+		return StatusStopped, nil
 	}
-	if running {
-		return StatusRunning, nil
-	}
-	return StatusStopped, nil
+	return StatusRunning, nil
 }
 
 func (ws *windowsService) allUsersStart() error {
 	if !isPrivileged() {
 		return ErrRequiresPrivilege
 	}
-	m, err := lowPrivMgr()
+	m, in, found, err := ws.sessionInstance()
 	if err != nil {
 		return err
 	}
 	defer m.Disconnect()
 
-	_, running, err := ws.ownInstance(m)
-	if err != nil || running {
-		return err
+	switch {
+	case !found:
+		return errNoSessionInstance
+	case in.state == windows.SERVICE_STOPPED:
+		return startInstance(m, in.name)
+	case in.state == windows.SERVICE_STOP_PENDING:
+		return fmt.Errorf("%s: %w", in.name, errInstanceStopping)
 	}
-	return ws.startStoppedInstance(m)
+	return nil
 }
 
-var errNoSessionInstance = errors.New("the service has no instance in this session until the next logon")
-
-// We can't find a stopped instance on its own. We need need to derive the
-// user suffix from a different running process.
-func (ws *windowsService) startStoppedInstance(m *mgr.Mgr) error {
-	services, err := listServices(m)
+func (ws *windowsService) allUsersStop() error {
+	if !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
+	m, in, found, err := ws.sessionInstance()
 	if err != nil {
 		return err
 	}
-	session, err := processSession(windows.GetCurrentProcessId())
+	defer m.Disconnect()
+
+	if !found || in.state == windows.SERVICE_STOPPED {
+		return nil
+	}
+	return stopInstances(m, []string{in.name})
+}
+
+func (ws *windowsService) allUsersRestart() error {
+	if !isPrivileged() {
+		return ErrRequiresPrivilege
+	}
+	m, in, found, err := ws.sessionInstance()
 	if err != nil {
 		return err
 	}
-	suffix, ok := logonSuffix(services, session)
-	if !ok {
-		return errNoSessionInstance
-	}
-	err = startInstance(m, ws.Name+"_"+suffix)
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return errNoSessionInstance
-	}
-	return err
-}
+	defer m.Disconnect()
 
-type serviceState struct {
-	name  string
-	typ   uint32
-	state uint32
-	pid   uint32
+	if !found {
+		return errNoSessionInstance
+	}
+	if in.state != windows.SERVICE_STOPPED {
+		if err := stopInstances(m, []string{in.name}); err != nil {
+			return err
+		}
+	}
+	return startInstance(m, in.name)
 }
 
 func logonSuffix(services []serviceState, session uint32) (string, bool) {
@@ -795,46 +830,6 @@ func listServices(m *mgr.Mgr) ([]serviceState, error) {
 	return services, nil
 }
 
-func (ws *windowsService) allUsersStop() error {
-	if !isPrivileged() {
-		return ErrRequiresPrivilege
-	}
-	m, err := lowPrivMgr()
-	if err != nil {
-		return err
-	}
-	defer m.Disconnect()
-
-	name, running, err := ws.ownInstance(m)
-	if err != nil || !running {
-		return err
-	}
-	return stopInstances(m, []string{name})
-}
-
-func (ws *windowsService) allUsersRestart() error {
-	if !isPrivileged() {
-		return ErrRequiresPrivilege
-	}
-	m, err := lowPrivMgr()
-	if err != nil {
-		return err
-	}
-	defer m.Disconnect()
-
-	name, running, err := ws.ownInstance(m)
-	if err != nil {
-		return err
-	}
-	if !running {
-		return ws.startStoppedInstance(m)
-	}
-	if err := stopInstances(m, []string{name}); err != nil {
-		return err
-	}
-	return startInstance(m, name)
-}
-
 func (ws *windowsService) StartAll() error {
 	m, instances, err := ws.allInstances()
 	if err != nil {
@@ -844,7 +839,7 @@ func (ws *windowsService) StartAll() error {
 
 	var errs []error
 	for _, in := range instances {
-		if in.state == svc.Stopped {
+		if in.state == windows.SERVICE_STOPPED {
 			errs = append(errs, startInstance(m, in.name))
 		}
 	}
@@ -862,14 +857,14 @@ func (ws *windowsService) StopAll() error {
 
 	var names []string
 	for _, in := range instances {
-		if in.state != svc.Stopped {
+		if in.state != windows.SERVICE_STOPPED {
 			names = append(names, in.name)
 		}
 	}
 	return stopInstances(m, names)
 }
 
-func (ws *windowsService) allInstances() (*mgr.Mgr, []instanceState, error) {
+func (ws *windowsService) allInstances() (*mgr.Mgr, []serviceState, error) {
 	if ws.level != ServiceLevelAllUsers {
 		return nil, nil, ErrUnsupportedOperation
 	}
@@ -913,6 +908,11 @@ func stopInstances(m *mgr.Mgr, names []string) error {
 		}
 		defer s.Close()
 		_, err = s.Control(svc.Stop)
+		if errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+			if status, qerr := s.Query(); qerr == nil && status.State == svc.StopPending {
+				err = nil
+			}
+		}
 		switch {
 		case errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE):
 		case err != nil:

@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
@@ -157,36 +156,49 @@ func TestWindowsInstancesOf(t *testing.T) {
 			t.Errorf("%s: instancesOf(%q) = %v, want included %v", tt.reason, tt.service.name, got, tt.want)
 			continue
 		}
-		want := instanceState{tt.service.name, svc.State(tt.service.state), tt.service.pid}
-		if tt.want && got[0] != want {
-			t.Errorf("%s: instancesOf(%q) = %v, want %v", tt.reason, tt.service.name, got[0], want)
+		if tt.want && got[0] != tt.service {
+			t.Errorf("%s: instancesOf(%q) = %v, want %v", tt.reason, tt.service.name, got[0], tt.service)
 		}
 	}
 }
 
-func TestWindowsOwnRunningInstance(t *testing.T) {
-	stubProcessSession(t, map[uint32]uint32{20: 2, 30: 3})
-	mine := instanceState{"Svc_aa", svc.Running, 20}
-	other := instanceState{"Svc_bb", svc.Running, 30}
-	denied := instanceState{"Svc_cc", svc.Running, 40}
-	stopped := instanceState{"Svc_dd", svc.Stopped, 0}
+func TestWindowsOwnInstance(t *testing.T) {
+	// The caller is in session 2. Processes 20-23 are in session 2, 30 in
+	// session 3, and 40 can't be read.
+	stubProcessSession(t, map[uint32]uint32{20: 2, 21: 2, 22: 2, 23: 2, 30: 3})
+	const instance = serviceUserServiceInstance | serviceUserOwnProcess
+	template := serviceState{"Svc", serviceUserOwnProcess, windows.SERVICE_STOPPED, 0}
+	running := serviceState{"Svc_4f2a1c", instance, windows.SERVICE_RUNNING, 20}
+	stopping := serviceState{"Svc_4f2a1c", instance, windows.SERVICE_STOP_PENDING, 21}
+	paused := serviceState{"Svc_4f2a1c", instance, windows.SERVICE_PAUSED, 22}
+	stopped := serviceState{"Svc_4f2a1c", instance, windows.SERVICE_STOPPED, 0}
+	other := serviceState{"Svc_9e01b7", instance, windows.SERVICE_RUNNING, 30}
+	denied := serviceState{"Svc_77aa01", instance, windows.SERVICE_RUNNING, 40}
+	donor := serviceState{"cbdhsvc_4f2a1c", instance, windows.SERVICE_RUNNING, 23}
+	otherDonor := serviceState{"cbdhsvc_9e01b7", instance, windows.SERVICE_RUNNING, 30}
 
 	tests := []struct {
-		name      string
-		instances []instanceState
-		want      string
+		name     string
+		services []serviceState
+		want     serviceState
+		found    bool
+		err      error
 	}{
-		{"no instances", nil, ""},
-		{"mine", []instanceState{mine}, "Svc_aa"},
-		{"other session", []instanceState{other}, ""},
-		{"access denied", []instanceState{denied}, ""},
-		{"stopped", []instanceState{stopped}, ""},
-		{"mix", []instanceState{other, denied, stopped, mine}, "Svc_aa"},
+		{"not installed", []serviceState{running}, serviceState{}, false, ErrNotInstalled},
+		{"no instances", []serviceState{template}, serviceState{}, false, nil},
+		{"running", []serviceState{template, other, denied, running}, running, true, nil},
+		{"stopping", []serviceState{template, stopping}, stopping, true, nil},
+		{"paused", []serviceState{template, paused}, paused, true, nil},
+		{"other session only", []serviceState{template, other, otherDonor}, serviceState{}, false, nil},
+		{"access denied", []serviceState{template, denied}, serviceState{}, false, nil},
+		{"stopped, found by suffix", []serviceState{template, other, stopped, donor}, stopped, true, nil},
+		{"suffix without instance", []serviceState{template, other, donor}, serviceState{}, false, nil},
+		{"stopped, no suffix", []serviceState{template, stopped}, serviceState{}, false, nil},
 	}
 	for _, tt := range tests {
-		got, ok := ownRunningInstance(tt.instances, 2)
-		if got != tt.want || ok != (tt.want != "") {
-			t.Errorf("%s: ownRunningInstance = %q, %v, want %q", tt.name, got, ok, tt.want)
+		got, found, err := ownInstance(tt.services, "Svc", 2)
+		if got != tt.want || found != tt.found || !errors.Is(err, tt.err) {
+			t.Errorf("%s: ownInstance = %v, %v, %v, want %v, %v, %v", tt.name, got, found, err, tt.want, tt.found, tt.err)
 		}
 	}
 }
