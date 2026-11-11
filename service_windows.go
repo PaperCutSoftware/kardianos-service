@@ -907,6 +907,9 @@ func stopInstances(m *mgr.Mgr, names []string) error {
 	var stopping []*mgr.Service
 	for _, name := range names {
 		s, err := openService(m, name, windows.SERVICE_STOP|windows.SERVICE_QUERY_STATUS)
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			continue
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", name, err))
 			continue
@@ -940,6 +943,7 @@ func waitStopped(services []*mgr.Service, timeout time.Duration) error {
 		for _, s := range services {
 			status, err := s.Query()
 			switch {
+			case errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST):
 			case err != nil:
 				errs = append(errs, fmt.Errorf("%s: %w", s.Name, err))
 			case status.State != svc.Stopped:
