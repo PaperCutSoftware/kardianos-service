@@ -113,9 +113,19 @@ const (
 type ServiceLevel string
 
 const (
-	ServiceLevelSystem   ServiceLevel = "system"   // Runs once for the whole machine.
-	ServiceLevelAllUsers ServiceLevel = "allusers" // Installed once, runs in every user's session.
-	ServiceLevelUser     ServiceLevel = "user"     // Runs only for the user who installed it.
+	// ServiceLevelSystem runs once for the whole machine.
+	ServiceLevelSystem ServiceLevel = "system"
+	// ServiceLevelAllUsers is installed once and runs in each user's desktop
+	// session. On systemd it needs a desktop that starts
+	// graphical-session.target (GNOME 3.34+, KDE Plasma 5.25+ with systemd
+	// startup, Cinnamon 6+) and never runs for SSH, TTY or linger sessions;
+	// other desktops (RHEL/Rocky 8's GNOME, Xfce, MATE, LXQt) get no copy.
+	// Install reloads running user managers: an error returned after the unit
+	// is written means it is installed but the named users' managers were not
+	// reloaded.
+	ServiceLevelAllUsers ServiceLevel = "allusers"
+	// ServiceLevelUser runs only for the user who installed it.
+	ServiceLevelUser ServiceLevel = "user"
 )
 
 // Config provides the setup for a Service. The Name field is required.
@@ -190,6 +200,9 @@ var (
 	// ErrUnsupportedOperation is returned for an operation that this service
 	// level does not support on this platform.
 	ErrUnsupportedOperation = errors.New("this operation is not supported for this service level on this platform")
+	// ErrNoDesktopSession is returned by systemd AllUsers services when the
+	// user has no desktop session (graphical-session.target is not active).
+	ErrNoDesktopSession = errors.New("the user has no desktop session")
 )
 
 // New creates a new service based on a service interface and configuration.
@@ -522,7 +535,8 @@ type Service interface {
 // privileges, and act on the copy running for every logged-in user.
 // They return ErrUnsupportedOperation for other service levels.
 type AllUsersController interface {
-	// StartAll starts the service for every logged-in user whose copy is not running.
+	// StartAll starts the service for every user logged into a desktop
+	// session whose copy is not running. Users without one are skipped.
 	StartAll() error
 	// StopAll stops every running copy, and returns once they have stopped.
 	StopAll() error

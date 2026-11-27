@@ -22,8 +22,9 @@ import (
 const (
 	ctrName     = "testsvc"
 	ctrExe      = "/usr/local/bin/testsvc"
+	ctrUserDir  = "/etc/systemd/user"
 	ctrUnit     = "/etc/systemd/user/testsvc.service"
-	ctrWantsDir = "/etc/systemd/user/default.target.wants"
+	ctrWantsDir = "/etc/systemd/user/graphical-session.target.wants"
 	ctrTestsvc  = "/opt/test/testsvc"
 	// The harness writes this file after boot. The guard does not use
 	// /proc/1/environ, because the helper runs as alice and cannot read it.
@@ -37,11 +38,45 @@ const (
 	// (10 s by default) after their manager stops.
 	ctrResetWait = 30 * time.Second
 
-	// helperEnv makes TestContainerHelperUserCommands run, as the user.
+	// helperEnv makes the TestContainerHelper tests run, as the user.
 	helperEnv = "SYSTEMD_CONTAINER_HELPER"
 )
 
 var ctrUsers = []string{"alice", "bob", "greeter"}
+
+// A fake desktop session. Like gnome-session.target and
+// plasma-workspace.target, the session target pulls in graphical-session.target,
+// which refuses a manual start. As those desktops do, it hands DISPLAY to the
+// manager before graphical-session.target is reached.
+const (
+	ctrDesktop         = "testsvc-desktop.target"
+	ctrDesktopShutdown = "testsvc-desktop-shutdown.target"
+	ctrDisplay         = ":99"
+)
+
+var ctrDesktopUnits = map[string]string{
+	ctrDesktop: `[Unit]
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=testsvc-desktop-env.service
+`,
+	// A bare systemctl needs systemd 239+; Ubuntu 20.04 has no /usr/bin/systemctl.
+	"testsvc-desktop-env.service": `[Unit]
+Before=graphical-session.target
+PartOf=` + ctrDesktop + `
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=systemctl --user set-environment DISPLAY=` + ctrDisplay + `
+ExecStop=systemctl --user unset-environment DISPLAY
+`,
+	// GNOME's logout: gnome-session-shutdown.target conflicts with the session.
+	ctrDesktopShutdown: `[Unit]
+Conflicts=graphical-session.target ` + ctrDesktop + `
+After=graphical-session.target ` + ctrDesktop + `
+`,
+}
 
 func requireContainer(t *testing.T) {
 	t.Helper()
@@ -68,6 +103,12 @@ func setupContainer(t *testing.T) *systemd {
 	}
 	resetContainer(t, s)
 	t.Cleanup(func() { resetContainer(t, s) })
+	// Written before any user manager starts, so none needs a reload.
+	for name, unit := range ctrDesktopUnits {
+		if err := os.WriteFile(filepath.Join(ctrUserDir, name), []byte(unit), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return s
 }
 
@@ -140,6 +181,9 @@ func resetContainer(t *testing.T, s *systemd) {
 	for _, m := range markers {
 		os.Remove(m)
 	}
+	for name := range ctrDesktopUnits {
+		os.Remove(filepath.Join(ctrUserDir, name))
+	}
 	os.Remove("/home/alice/testsvc")
 }
 
@@ -180,6 +224,51 @@ func linger(t *testing.T, s *systemd, u loginUser) {
 	})
 }
 
+// desktopLogin starts u's manager, then a desktop session in it.
+func desktopLogin(t *testing.T, s *systemd, u loginUser) {
+	t.Helper()
+	linger(t, s, u)
+	if out, err := userCtl(s, u, "start", ctrDesktop); err != nil {
+		t.Fatalf("%s: start %s: %v: %s", u.name, ctrDesktop, err, out)
+	}
+	waitForDesktop(t, s, u, "active")
+	// The target only Wants= the environment unit, so its failure is silent.
+	if out, _ := userCtl(s, u, "show-environment"); !strings.Contains("\n"+out+"\n", "\nDISPLAY="+ctrDisplay+"\n") {
+		t.Fatalf("%s's manager has no DISPLAY=%s:\n%s", u.name, ctrDisplay, out)
+	}
+}
+
+// desktopLogout ends u's desktop session the way Plasma does, by stopping the
+// session target.
+func desktopLogout(t *testing.T, s *systemd, u loginUser) {
+	t.Helper()
+	if out, err := userCtl(s, u, "stop", ctrDesktop); err != nil {
+		t.Fatalf("%s: stop %s: %v: %s", u.name, ctrDesktop, err, out)
+	}
+	waitForDesktop(t, s, u, "inactive")
+}
+
+// desktopLogoutGNOME ends u's desktop session the way GNOME does, by starting
+// a target that conflicts with it.
+func desktopLogoutGNOME(t *testing.T, s *systemd, u loginUser) {
+	t.Helper()
+	if out, err := userCtl(s, u, "start", ctrDesktopShutdown); err != nil {
+		t.Fatalf("%s: start %s: %v: %s", u.name, ctrDesktopShutdown, err, out)
+	}
+	waitForDesktop(t, s, u, "inactive")
+}
+
+func waitForDesktop(t *testing.T, s *systemd, u loginUser, state string) {
+	t.Helper()
+	waitFor(t, u.name+"'s graphical-session.target to be "+state, func() bool {
+		out, _ := userCtl(s, u, "is-active", "graphical-session.target")
+		return out == state
+	})
+	if !managerActive(u) {
+		t.Fatalf("%s's user manager stopped", u.name)
+	}
+}
+
 // userCtl runs "systemctl --user args" in u's manager, the way StartAll does.
 func userCtl(s *systemd, u loginUser, args ...string) (string, error) {
 	argv := systemctlAsUser(s.getSystemdVersion(), u, args...)
@@ -200,13 +289,14 @@ func markerPID(name, event string) int {
 	return pid
 }
 
-func alive(pid int) bool {
-	return pid > 0 && exists(fmt.Sprintf("/proc/%d", pid))
+// markerDisplay returns the DISPLAY that name's copy started with.
+func markerDisplay(name string) string {
+	data, _ := os.ReadFile(markerPath(name, "display"))
+	return string(data)
 }
 
-func exists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func alive(pid int) bool {
+	return pid > 0 && exists(fmt.Sprintf("/proc/%d", pid))
 }
 
 // running waits for name's copy to start, and returns its PID.
@@ -264,7 +354,7 @@ func tryRun(name string, args ...string) (string, error) {
 
 func TestContainerAllUsersInstall(t *testing.T) {
 	s := setupContainer(t)
-	alice, greeter := lookupUser(t, "alice"), lookupUser(t, "greeter")
+	alice, bob, greeter := lookupUser(t, "alice"), lookupUser(t, "bob"), lookupUser(t, "greeter")
 
 	if err := s.Install(); err != nil {
 		t.Fatal(err)
@@ -279,12 +369,94 @@ func TestContainerAllUsersInstall(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(ctrWantsDir, ctrName+".service")); err != nil {
 		t.Errorf("not enabled: %v", err)
 	}
+	if _, err := os.Lstat(filepath.Join(ctrUserDir, "default.target.wants", ctrName+".service")); err == nil {
+		t.Error("enabled in default.target.wants")
+	}
+
+	desktopLogin(t, s, alice)
+	running(t, "alice")
+	if got := markerDisplay("alice"); got != ctrDisplay {
+		t.Errorf("alice's copy has DISPLAY=%q, want %q", got, ctrDisplay)
+	}
+
+	linger(t, s, bob)
+	desktopLogin(t, s, greeter)
+	never(t, "a user without a desktop, or a system user, got a copy", func() bool {
+		return exists(markerPath("bob", "started")) || exists(markerPath("greeter", "started"))
+	})
+}
+
+func TestContainerAllUsersDesktopLogout(t *testing.T) {
+	logouts := map[string]func(*testing.T, *systemd, loginUser){
+		"Plasma": desktopLogout,
+		"GNOME":  desktopLogoutGNOME,
+	}
+	for name, logout := range logouts {
+		t.Run(name, func(t *testing.T) {
+			s := setupContainer(t)
+			alice := lookupUser(t, "alice")
+
+			if err := s.Install(); err != nil {
+				t.Fatal(err)
+			}
+			desktopLogin(t, s, alice)
+			pid := running(t, "alice")
+
+			logout(t, s, alice)
+			waitFor(t, "alice's copy to stop", func() bool { return !alive(pid) })
+			if markerPID("alice", "stopped") != pid {
+				t.Error("alice's copy exited without running Stop")
+			}
+			if !managerActive(alice) {
+				t.Fatal("alice's user manager stopped")
+			}
+
+			desktopLogin(t, s, alice)
+			if again := running(t, "alice"); again == pid {
+				t.Errorf("no new copy after logging in again: PID %d", again)
+			}
+		})
+	}
+}
+
+// A user whose manager already runs, and has loaded graphical-session.target,
+// gets a copy at their next desktop login without StartAll.
+func TestContainerAllUsersManagerRunningAtInstall(t *testing.T) {
+	s := setupContainer(t)
+	alice := lookupUser(t, "alice")
+
+	const loader = "testsvc-loader.service"
+	wants := filepath.Join(ctrUserDir, "default.target.wants")
+	link := filepath.Join(wants, loader)
+	if err := os.WriteFile(filepath.Join(ctrUserDir, loader), []byte(`[Unit]
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(wants, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(ctrUserDir, loader), link); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Remove(link)
+		os.Remove(filepath.Join(ctrUserDir, loader))
+	})
 
 	linger(t, s, alice)
-	running(t, "alice")
+	if err := s.Install(); err != nil {
+		t.Fatal(err)
+	}
+	never(t, "Install started a copy without a desktop", func() bool { return exists(markerPath("alice", "started")) })
 
-	linger(t, s, greeter)
-	never(t, "greeter got a copy", func() bool { return exists(markerPath("greeter", "started")) })
+	desktopLogin(t, s, alice)
+	running(t, "alice")
 }
 
 func TestContainerAllUsersOwnership(t *testing.T) {
@@ -305,13 +477,13 @@ func TestContainerAllUsersStartAll(t *testing.T) {
 	s := setupContainer(t)
 	alice, bob := lookupUser(t, "alice"), lookupUser(t, "bob")
 
-	// alice's manager starts before the unit exists, so it doesn't start her
-	// copy; bob's starts after, so it does.
-	linger(t, s, alice)
+	// alice logs in before the unit exists, so her desktop doesn't start a
+	// copy; bob logs in after, so his does.
+	desktopLogin(t, s, alice)
 	if err := s.Install(); err != nil {
 		t.Fatal(err)
 	}
-	linger(t, s, bob)
+	desktopLogin(t, s, bob)
 	bobPID := running(t, "bob")
 	never(t, "alice got a copy before StartAll", func() bool { return exists(markerPath("alice", "started")) })
 
@@ -324,6 +496,26 @@ func TestContainerAllUsersStartAll(t *testing.T) {
 	}
 }
 
+func TestContainerAllUsersStartAllNoDesktop(t *testing.T) {
+	s := setupContainer(t)
+	alice, bob := lookupUser(t, "alice"), lookupUser(t, "bob")
+
+	desktopLogin(t, s, alice)
+	linger(t, s, bob)
+	if err := s.Install(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.StartAll(); err != nil {
+		t.Fatal(err)
+	}
+	running(t, "alice")
+	never(t, "bob got a copy without a desktop", func() bool { return exists(markerPath("bob", "started")) })
+	if out, _ := userCtl(s, bob, "is-active", s.unitName()); out != "inactive" {
+		t.Errorf("bob's unit is %q after StartAll, want inactive", out)
+	}
+}
+
 func TestContainerAllUsersStopAll(t *testing.T) {
 	s := setupContainer(t)
 	users := []loginUser{lookupUser(t, "alice"), lookupUser(t, "bob")}
@@ -333,7 +525,7 @@ func TestContainerAllUsersStopAll(t *testing.T) {
 	}
 	pids := map[string]int{}
 	for _, u := range users {
-		linger(t, s, u)
+		desktopLogin(t, s, u)
 		pids[u.name] = running(t, u.name)
 	}
 
@@ -362,7 +554,7 @@ func TestContainerAllUsersUninstall(t *testing.T) {
 	if err := s.Install(); err != nil {
 		t.Fatal(err)
 	}
-	linger(t, s, alice)
+	desktopLogin(t, s, alice)
 	pid := running(t, "alice")
 
 	if err := s.Uninstall(); err != nil {
@@ -370,6 +562,9 @@ func TestContainerAllUsersUninstall(t *testing.T) {
 	}
 	if exists(ctrUnit) {
 		t.Error("unit file is still there")
+	}
+	if _, err := os.Lstat(filepath.Join(ctrWantsDir, ctrName+".service")); err == nil {
+		t.Error("enable link is still there")
 	}
 	never(t, "Uninstall stopped alice's copy", func() bool { return !alive(pid) })
 
@@ -397,7 +592,7 @@ func TestContainerAllUsersUserCommands(t *testing.T) {
 	if err := s.Install(); err != nil {
 		t.Fatal(err)
 	}
-	linger(t, s, alice)
+	desktopLogin(t, s, alice)
 	running(t, "alice")
 
 	for name, cmd := range map[string]func() error{
@@ -411,16 +606,22 @@ func TestContainerAllUsersUserCommands(t *testing.T) {
 		}
 	}
 
+	runHelper(t, alice, "TestContainerHelperUserCommands")
+}
+
+// runHelper runs the helper test as u, in u's manager.
+func runHelper(t *testing.T, u loginUser, test string) {
+	t.Helper()
 	testBin, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := tryRun("runuser", "-u", alice.name, "--", "env",
-		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", alice.uid), helperEnv+"=1",
-		testBin, "-test.v", "-test.run", "^TestContainerHelperUserCommands$")
-	t.Logf("as alice:\n%s", out)
-	if err != nil || !strings.Contains(out, "--- PASS: TestContainerHelperUserCommands") {
-		t.Errorf("user commands failed as alice: %v", err)
+	out, err := tryRun("runuser", "-u", u.name, "--", "env",
+		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", u.uid), helperEnv+"=1",
+		testBin, "-test.v", "-test.run", "^"+test+"$")
+	t.Logf("as %s:\n%s", u.name, out)
+	if err != nil || !strings.Contains(out, "--- PASS: "+test) {
+		t.Errorf("%s failed as %s: %v", test, u.name, err)
 	}
 }
 
@@ -454,7 +655,7 @@ func TestContainerHelperUserCommands(t *testing.T) {
 	status(StatusRunning)
 }
 
-func TestContainerAllUsersPath(t *testing.T) {
+func TestContainerAllUsersUserCommandsNoDesktop(t *testing.T) {
 	s := setupContainer(t)
 	alice := lookupUser(t, "alice")
 
@@ -462,6 +663,43 @@ func TestContainerAllUsersPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	linger(t, s, alice)
+	runHelper(t, alice, "TestContainerHelperNoDesktop")
+}
+
+// TestContainerHelperNoDesktop runs as alice, started by
+// TestContainerAllUsersUserCommandsNoDesktop, with her manager running but no
+// desktop session.
+func TestContainerHelperNoDesktop(t *testing.T) {
+	if os.Getenv(helperEnv) == "" {
+		t.Skip("run by TestContainerAllUsersUserCommandsNoDesktop")
+	}
+	requireContainer(t)
+	s := ctrService(t, ctrExe)
+
+	for name, cmd := range map[string]func() error{"Start": s.Start, "Restart": s.Restart} {
+		if err := cmd(); !errors.Is(err, ErrNoDesktopSession) {
+			t.Errorf("%s err = %v, want %v", name, err, ErrNoDesktopSession)
+		}
+	}
+	if got, err := s.Status(); err != nil || got != StatusStopped {
+		t.Errorf("Status() = %v, %v, want %v", got, err, StatusStopped)
+	}
+	if err := s.Stop(); err != nil {
+		t.Errorf("Stop err = %v, want nil", err)
+	}
+	if exists(markerPath("alice", "started")) {
+		t.Error("alice got a copy without a desktop")
+	}
+}
+
+func TestContainerAllUsersPath(t *testing.T) {
+	s := setupContainer(t)
+	alice := lookupUser(t, "alice")
+
+	if err := s.Install(); err != nil {
+		t.Fatal(err)
+	}
+	desktopLogin(t, s, alice)
 
 	var (
 		mu    sync.Mutex
@@ -517,13 +755,4 @@ func TestContainerAllUsersMinVersion(t *testing.T) {
 	if exists(ctrUnit) {
 		t.Error("unit file was written")
 	}
-}
-
-func contains(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }

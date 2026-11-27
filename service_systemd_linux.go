@@ -246,7 +246,25 @@ func (s *systemd) Install() error {
 			return err
 		}
 	}
+	if s.level == ServiceLevelAllUsers {
+		return s.reloadAll()
+	}
 	return nil
+}
+
+// reloadAll makes running user managers load the new unit, so it starts at
+// their next desktop login without waiting for the manager to restart.
+func (s *systemd) reloadAll() error {
+	users, version, err := s.listAllUsers()
+	if err != nil {
+		return err
+	}
+	return forEachUser(users, loginUser.label, func(u loginUser) error {
+		if running, err := managerRunning(u); err != nil || !running {
+			return err
+		}
+		return runAsUser(version, u, "daemon-reload")
+	})
 }
 
 func (s *systemd) writeUnit(path, content string) error {
@@ -305,7 +323,7 @@ func (s *systemd) templateData(path string) map[string]any {
 	case ServiceLevelUser:
 		wantedBy, userScope = "default.target", "yes"
 	case ServiceLevelAllUsers:
-		wantedBy, userScope, allUsers = "default.target", "yes", "yes"
+		wantedBy, userScope, allUsers = "graphical-session.target", "yes", "yes"
 	}
 
 	return map[string]any{
@@ -425,7 +443,7 @@ func (s *systemd) installedStatus() (Status, error) {
 }
 
 func (s *systemd) Start() error {
-	if err := s.userContextRequired(); err != nil {
+	if err := s.requireDesktop(); err != nil {
 		return err
 	}
 	return s.runAction("start")
@@ -439,10 +457,48 @@ func (s *systemd) Stop() error {
 }
 
 func (s *systemd) Restart() error {
-	if err := s.userContextRequired(); err != nil {
+	if err := s.requireDesktop(); err != nil {
 		return err
 	}
 	return s.runAction("restart")
+}
+
+// requireDesktop checks the user may start an AllUsers copy: as the user, in a
+// desktop session.
+func (s *systemd) requireDesktop() error {
+	if err := s.userContextRequired(); err != nil {
+		return err
+	}
+	if s.level != ServiceLevelAllUsers {
+		return nil
+	}
+	_, out, err := s.runWithOutput("is-active", desktopTarget)
+	desktop, err := parseDesktopState(out, err)
+	if err != nil {
+		return err
+	}
+	if !desktop {
+		return ErrNoDesktopSession
+	}
+	return nil
+}
+
+// parseDesktopState reports whether "systemctl is-active" found the desktop
+// target active, given that command's output and error.
+func parseDesktopState(out string, err error) (bool, error) {
+	switch state := strings.TrimSpace(out); state {
+	case "active":
+		return true, nil
+	case "inactive", "deactivating", "failed":
+		return false, nil
+	case "":
+		if err == nil {
+			err = errors.New("no state reported")
+		}
+		return false, fmt.Errorf("checking %s: %w", desktopTarget, err)
+	default:
+		return false, fmt.Errorf("%s is in unexpected state %q", desktopTarget, state)
+	}
 }
 
 func (s *systemd) runWithOutput(args ...string) (int, string, error) {
@@ -456,6 +512,9 @@ func (s *systemd) runAction(action string) error {
 // the exit code of "systemctl stop" when the service isn't loaded
 const systemctlNotLoaded = 5
 
+// active only while the user is in a desktop session
+const desktopTarget = "graphical-session.target"
+
 // required for "systemctl -M user@"
 const minMachineUserVersion = 248
 
@@ -468,8 +527,8 @@ func (u loginUser) label() string {
 	return u.name
 }
 
-// StartAll starts the service for every logged-in user.
-// No-op for already running services.
+// StartAll starts the service for every user in a desktop session, skipping
+// the rest. No-op for already running services.
 func (s *systemd) StartAll() error {
 	users, version, err := s.listAllUsers()
 	if err != nil {
@@ -480,12 +539,15 @@ func (s *systemd) StartAll() error {
 			return err
 		}
 		// Picks up a unit file added or changed since the manager started.
-		reload := systemctlAsUser(version, u, "daemon-reload")
-		if err := run(reload[0], reload[1:]...); err != nil {
+		if err := runAsUser(version, u, "daemon-reload"); err != nil {
 			return err
 		}
-		start := systemctlAsUser(version, u, "start", s.unitName())
-		return run(start[0], start[1:]...)
+		argv := systemctlAsUser(version, u, "is-active", desktopTarget)
+		_, out, err := runWithOutput(argv[0], argv[1:]...)
+		if desktop, err := parseDesktopState(out, err); err != nil || !desktop {
+			return err
+		}
+		return runAsUser(version, u, "start", s.unitName())
 	})
 }
 
@@ -579,6 +641,11 @@ func systemctlAsUser(version int64, u loginUser, args ...string) []string {
 	}, args...)
 }
 
+func runAsUser(version int64, u loginUser, args ...string) error {
+	argv := systemctlAsUser(version, u, args...)
+	return run(argv[0], argv[1:]...)
+}
+
 // systemdScript is expanded by the mini template engine (renderTemplate).
 // {{if}}/{{range}} operate on plain string / []string values built in Install;
 // compound conditions such as "and .LogOutput .HasOutputFileSupport" or
@@ -587,6 +654,8 @@ const systemdScript = `[Unit]
 Description={{Description}}
 ConditionFileIsExecutable={{Path | cmdEscape}}
 {{if AllUsers}}ConditionUser=!@system
+PartOf=graphical-session.target
+After=graphical-session.target
 {{end}}{{range Dependencies}}{{.}}
 {{end}}
 [Service]
